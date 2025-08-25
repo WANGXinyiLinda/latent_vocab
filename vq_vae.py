@@ -1,333 +1,12 @@
 import torch
 from transformers import AutoTokenizer, AutoModel
 from typing import Union, List, Tuple
-import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn import MultiheadAttention
-
-
-def clean_tokens_for_display(tokens: List[str]) -> List[str]:
-    """
-    Clean BPE tokens for human-readable display by removing special characters.
-    
-    Args:
-        tokens: List of tokenized tokens
-        
-    Returns:
-        List of cleaned tokens
-    """
-    cleaned = []
-    for token in tokens:
-        # Remove common BPE artifacts
-        clean_token = token.replace('Ġ', ' ').replace('Ċ', '\n').replace('▁', ' ')
-        # Remove other common artifacts
-        clean_token = clean_token.replace('Ċ', '\n').replace('ċ', '\n')
-        clean_token = clean_token.replace('Ġ', ' ').replace('ġ', ' ')
-        cleaned.append(clean_token)
-    return cleaned
-
-
-def get_last_layer_representations(
-    model: AutoModel,
-    tokenizer: AutoTokenizer,
-    text: Union[str, List[str]],
-    device: str = "cpu",
-    max_length: int = 512,
-    return_tokens: bool = False,
-    split_delimiters: List[str] = ["\n", ".", "!", "?"]
-) -> Union[torch.Tensor, Tuple[torch.Tensor, List[str]], List[torch.Tensor], Tuple[List[torch.Tensor], List[List[str]]], List[List[torch.Tensor]], Tuple[List[List[torch.Tensor]], List[List[List[str]]]]]:
-    """
-    Extract the last layer representations from a Hugging Face pretrained language model.
-    
-    Args:
-        model (AutoModel): Hugging Face pretrained model
-        tokenizer (AutoTokenizer): Hugging Face pretrained tokenizer
-        text (Union[str, List[str]]): Input text or list of texts to process
-        device (str): Device to run the model on ("auto", "cpu", "cuda", or specific device)
-        max_length (int): Maximum sequence length for tokenization
-        return_tokens (bool): Whether to also return the tokenized tokens
-        split_delimiters (List[str]): List of text delimiters to split on (e.g., ["\n", ".", "Answer:"])
-        
-    Returns:
-        For single text input:
-            - If split_delimiters=None and return_tokens=False: tensor of shape (num_tokens, hidden_size)
-            - If split_delimiters=None and return_tokens=True: tuple of (tensor, token_list)
-            - If split_delimiters is provided and return_tokens=False: list of tensors, each of shape (num_tokens_in_segment, hidden_size)
-            - If split_delimiters is provided and return_tokens=True: tuple of (list_of_tensors, list_of_token_lists)
-        
-        For batch input:
-            - If split_delimiters=None and return_tokens=False: list of tensors
-            - If split_delimiters=None and return_tokens=True: tuple of (list_of_tensors, list_of_token_lists)
-            - If split_delimiters is provided and return_tokens=False: list of lists of tensors
-            - If split_delimiters is provided and return_tokens=True: tuple of (list_of_lists_of_tensors, list_of_lists_of_token_lists)
-    """
-    
-    # Handle batch processing
-    is_batch = isinstance(text, list)
-    if is_batch:
-        texts = text
-        if not texts:
-            return [] if not return_tokens else ([], [])
-    else:
-        texts = [text]
-    
-    # Auto-detect device if specified
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    # Move model to device
-    model = model.to(device)
-    model.eval()
-    
-    # Tokenize the input texts
-    inputs = tokenizer(
-        texts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-        return_offsets_mapping=True
-    )
-    
-    # Move inputs to device
-    input_ids = inputs["input_ids"].to(device)
-    attention_mask = inputs["attention_mask"].to(device)
-    
-    # Get the offset mappings for all texts
-    offset_mappings = [offset.cpu().numpy() for offset in inputs["offset_mapping"]]
-    
-    # Run the model
-    with torch.no_grad():
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True
-        )
-    
-    # Extract the last layer hidden states
-    # hidden_states is a tuple of (num_layers + 1) tensors
-    # The last element is the final layer output
-    last_hidden_states = outputs.hidden_states[-1]  # Shape: (batch_size, seq_len, hidden_size)
-    
-    # Convert to CPU if using CUDA
-    if device != "cpu":
-        last_hidden_states = last_hidden_states.cpu()
-    
-    # Process each text in the batch
-    batch_results = []
-    batch_tokens = []
-    
-    for batch_idx in range(len(texts)):
-        # Get the hidden states for this text
-        text_hidden_states = last_hidden_states[batch_idx]  # Shape: (seq_len, hidden_size)
-        
-        # Get the tokens for this text
-        text_tokens = tokenizer.convert_ids_to_tokens(input_ids[batch_idx])
-        
-        # Get the offset mapping for this text
-        text_offset_mapping = offset_mappings[batch_idx]
-        
-        # Filter out special tokens and get meaningful representations
-        meaningful_tokens = []
-        meaningful_representations = []
-        
-        for i, (token, offset) in enumerate(zip(text_tokens, text_offset_mapping)):
-            # Skip special tokens and padding
-            if token in tokenizer.special_tokens_map.values() or offset[0] == offset[1]:
-                continue
-            
-            meaningful_tokens.append(token)
-            meaningful_representations.append(text_hidden_states[i])
-        
-        # Handle splitting for this text
-        if split_delimiters:
-            # Split representations and tokens based on text-level delimiters
-            split_representations = []
-            split_token_lists = []
-            
-            # First, find all split positions in the original text
-            split_positions = []
-            for delimiter in split_delimiters:
-                start = 0
-                while True:
-                    pos = texts[batch_idx].find(delimiter, start)
-                    if pos == -1:
-                        break
-                    split_positions.append(pos + len(delimiter))  # Split after the delimiter
-                    start = pos + 1
-            
-            split_positions = sorted(split_positions)
-            
-            # Group tokens by their text positions
-            current_reprs = []
-            current_tokens = []
-            
-            for token, repr_tensor, offset in zip(meaningful_tokens, meaningful_representations, 
-                    [offset for offset in text_offset_mapping if offset[0] != offset[1]]):
-                current_reprs.append(repr_tensor)
-                current_tokens.append(token)
-                
-                # Check if we've passed a split position
-                while split_positions and offset[1] >= split_positions[0]:
-                    # Finalize current segment
-                    if current_reprs:
-                        split_representations.append(torch.stack(current_reprs))
-                        split_token_lists.append(current_tokens)
-                        current_reprs = []
-                        current_tokens = []
-                    
-                    split_positions.pop(0)  # Remove the processed split position
-            
-            # Add final segment if there are remaining tokens
-            if current_reprs:
-                split_representations.append(torch.stack(current_reprs))
-                split_token_lists.append(current_tokens)
-            
-            # Handle empty case
-            if not split_representations:
-                empty_tensor = torch.empty(0, last_hidden_states.shape[-1])
-                split_representations = [empty_tensor]
-                split_token_lists = [[]]
-            
-            batch_results.append(split_representations)
-            batch_tokens.append(split_token_lists)
-        else:
-            # No splitting - stack the representations
-            if meaningful_representations:
-                meaningful_representations = torch.stack(meaningful_representations)
-            else:
-                # If no meaningful tokens, return empty tensor
-                meaningful_representations = torch.empty(0, last_hidden_states.shape[-1])
-            
-            batch_results.append(meaningful_representations)
-            batch_tokens.append(meaningful_tokens)
-    
-    # Return results based on input type and parameters
-    if not is_batch:
-        # Single text input - return first (and only) result
-        if return_tokens:
-            return batch_results[0], batch_tokens[0]
-        else:
-            return batch_results[0]
-    else:
-        # Batch input - return all results
-        if return_tokens:
-            return batch_results, batch_tokens
-        else:
-            return batch_results
-
-
-class MultiHeadAttentionQuantizer(nn.Module):
-    """
-    Multi-head attention based quantizer that maps representations to k vectors.
-    Uses learnable query vectors instead of the input representations.
-    """
-    
-    def __init__(self, hidden_size: int, num_heads: int, k: int, dropout: float = 0.1):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.k = k
-        self.head_dim = hidden_size // num_heads
-        
-        # Learnable query vectors (k vectors)
-        self.learnable_queries = nn.Parameter(torch.randn(k, hidden_size))
-        
-        # Multi-head attention layer
-        self.attention = MultiheadAttention(
-            embed_dim=hidden_size,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        # Output projection
-        self.output_projection = nn.Linear(hidden_size, hidden_size)
-        self.layer_norm = nn.LayerNorm(hidden_size)
-        
-    def forward(self, representations: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            representations: Input representations of shape (batch_size, seq_len, hidden_size)
-            
-        Returns:
-            Quantized vectors of shape (batch_size, k, hidden_size)
-        """
-        batch_size = representations.shape[0]
-        
-        # Expand learnable queries to batch size
-        # queries: (batch_size, k, hidden_size)
-        queries = self.learnable_queries.unsqueeze(0).expand(batch_size, -1, -1)
-        
-        # Apply multi-head attention
-        # queries as query, representations as key and value
-        attended_output, _ = self.attention(
-            query=queries,
-            key=representations,
-            value=representations
-        )
-        
-        # Apply output projection and layer norm
-        output = self.output_projection(attended_output)
-        output = self.layer_norm(output)
-        
-        return output
-
-
-class VectorQuantizer(nn.Module):
-    """
-    Vector Quantizer that maps continuous vectors to discrete indices.
-    """
-    
-    def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float = 0.25):
-        super().__init__()
-        self.num_embeddings = num_embeddings
-        self.embedding_dim = embedding_dim
-        self.commitment_cost = commitment_cost
-        
-        # Embedding table
-        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
-        
-        # Initialize embeddings
-        self.embedding.weight.data.uniform_(-1/num_embeddings, 1/num_embeddings)
-        
-    def forward(self, inputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            inputs: Input vectors of shape (batch_size, k, embedding_dim)
-            
-        Returns:
-            Tuple of (quantized, loss, perplexity)
-        """
-        # Reshape inputs for easier processing
-        batch_size, k, embedding_dim = inputs.shape
-        flat_inputs = inputs.view(-1, embedding_dim)
-        
-        # Calculate distances to all embeddings
-        distances = torch.sum(flat_inputs**2, dim=1, keepdim=True) + \
-                   torch.sum(self.embedding.weight**2, dim=1) - \
-                   2 * torch.matmul(flat_inputs, self.embedding.weight.t())
-        
-        # Find closest embeddings
-        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
-        encodings = torch.zeros(encoding_indices.shape[0], self.num_embeddings, device=inputs.device)
-        encodings.scatter_(1, encoding_indices, 1)
-        
-        # Quantize and unflatten
-        quantized = torch.matmul(encodings, self.embedding.weight)
-        quantized = quantized.view(batch_size, k, embedding_dim)
-        
-        # Calculate loss
-        e_latent_loss = F.mse_loss(quantized.detach(), inputs)
-        q_latent_loss = F.mse_loss(quantized, inputs.detach())
-        loss = q_latent_loss + self.commitment_cost * e_latent_loss
-        
-        # Calculate perplexity
-        avg_probs = torch.mean(encodings, dim=0)
-        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
-        
-        return quantized, loss, perplexity
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from encoder import get_last_layer_representations, MultiHeadAttentionQuantizer, VectorQuantizer
 
 
 class VQVAETextReconstructor(nn.Module):
@@ -337,37 +16,59 @@ class VQVAETextReconstructor(nn.Module):
     
     def __init__(
         self,
-        encoder_model: AutoModel,
-        decoder_model: AutoModel,
-        tokenizer: AutoTokenizer,
         num_latent_tokens: int,
-        hidden_size: int,
         num_heads: int,
         k: int,
         commitment_cost: float = 0.25,
-        explain_token: str = "<EXPLAIN>"
+        explain_token: str = "<EXPLAIN>",
+        think_token: str = "<THINK>",
+        pretrained_model_name: str = None,
+        prompt: str = None,
+        compress_cot_only: bool = True,
+        max_length: int = 512,
+        train_decoder: bool = False,
+        previous_segments_mode: str = "text" # "text" or "latent"
     ):
         super().__init__()
-        self.encoder_model = encoder_model
-        self.decoder_model = decoder_model
-        self.tokenizer = tokenizer
         self.num_latent_tokens = num_latent_tokens
-        self.hidden_size = hidden_size
+        self.num_heads = num_heads
         self.k = k
+        self.commitment_cost = commitment_cost
         self.explain_token = explain_token
+        self.think_token = think_token
+        self.prompt = prompt
+        self.compress_cot_only = compress_cot_only
+        self.max_length = max_length
+        self.train_decoder = train_decoder
+        self.previous_segments_mode = previous_segments_mode
+        if pretrained_model_name is None:
+            raise ValueError("pretrained_model_name is required")
+        self.pretrained_model_name = pretrained_model_name
         
-        # Freeze encoder and decoder models
+        # Load encoder and decoder models
+        self.encoder_model = AutoModel.from_pretrained(pretrained_model_name)
+        self.decoder_model = AutoModel.from_pretrained(pretrained_model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name)
+        
+        # Freeze encoder model
+        self.encoder_model.eval()
         for param in self.encoder_model.parameters():
             param.requires_grad = False
-        for param in self.decoder_model.parameters():
-            param.requires_grad = False
         
-        # Add new latent tokens to vocabulary
-        self._add_latent_tokens()
+        # Freeze decoder model if not training
+        if self.train_decoder:
+            self.decoder_model.train()
+        else:
+            self.decoder_model.eval()
+            for param in self.decoder_model.parameters():
+                param.requires_grad = False
+        
+        # Get hidden size from encoder model
+        self.hidden_size = self.encoder_model.config.hidden_size
         
         # Multi-head attention quantizer
         self.quantizer = MultiHeadAttentionQuantizer(
-            hidden_size=hidden_size,
+            hidden_size=self.hidden_size,
             num_heads=num_heads,
             k=k
         )
@@ -375,355 +76,808 @@ class VQVAETextReconstructor(nn.Module):
         # Vector quantizer
         self.vq = VectorQuantizer(
             num_embeddings=num_latent_tokens,
-            embedding_dim=hidden_size,
+            embedding_dim=self.hidden_size,
             commitment_cost=commitment_cost
         )
         
-        # Projection layer to match hidden size
-        self.projection = nn.Linear(hidden_size, hidden_size)
+        # Add explain token embedding if specified
+        if self.explain_token:
+            self.explain_embedding = nn.Parameter(torch.randn(1, 1, self.hidden_size) * 0.02)
         
-    def _add_latent_tokens(self):
-        """Add new latent tokens to the tokenizer and model vocabulary."""
-        # Add latent tokens
-        latent_tokens = [f"<LATENT_{i}>" for i in range(self.num_latent_tokens)]
-        
-        # Add explain token if not already present
-        if self.explain_token not in self.tokenizer.get_vocab():
-            latent_tokens.append(self.explain_token)
-        
-        # Add tokens to tokenizer
-        self.tokenizer.add_tokens(latent_tokens)
-        
-        # Resize token embeddings for both encoder and decoder
-        if hasattr(self.encoder_model, 'resize_token_embeddings'):
-            self.encoder_model.resize_token_embeddings(len(self.tokenizer))
-        if hasattr(self.decoder_model, 'resize_token_embeddings'):
-            self.decoder_model.resize_token_embeddings(len(self.tokenizer))
-        
-        # Initialize new token embeddings
-        self._initialize_new_embeddings()
-    
-    def _initialize_new_embeddings(self):
-        """Initialize the embeddings for newly added tokens."""
-        # Get the token IDs for new tokens
-        latent_token_ids = []
-        for i in range(self.num_latent_tokens):
-            token = f"<LATENT_{i}>"
-            if token in self.tokenizer.get_vocab():
-                latent_token_ids.append(self.tokenizer.convert_tokens_to_ids(token))
-        
-        explain_token_id = None
-        if self.explain_token in self.tokenizer.get_vocab():
-            explain_token_id = self.tokenizer.convert_tokens_to_ids(self.explain_token)
-        
-        # Initialize encoder embeddings
-        if hasattr(self.encoder_model, 'embeddings'):
-            for token_id in latent_token_ids:
-                if token_id < self.encoder_model.embeddings.word_embeddings.num_embeddings:
-                    # Initialize with small random values
-                    self.encoder_model.embeddings.word_embeddings.weight.data[token_id] = \
-                        torch.randn(self.hidden_size) * 0.02
-        
-        # Initialize decoder embeddings (same as encoder for consistency)
-        if hasattr(self.decoder_model, 'embeddings'):
-            for token_id in latent_token_ids:
-                if token_id < self.decoder_model.embeddings.word_embeddings.num_embeddings:
-                    self.decoder_model.embeddings.word_embeddings.weight.data[token_id] = \
-                        self.encoder_model.embeddings.word_embeddings.weight.data[token_id]
-        
-        # Initialize explain token embeddings
-        if explain_token_id is not None:
-            if hasattr(self.encoder_model, 'embeddings'):
-                if explain_token_id < self.encoder_model.embeddings.word_embeddings.num_embeddings:
-                    self.encoder_model.embeddings.word_embeddings.weight.data[explain_token_id] = \
-                        torch.randn(self.hidden_size) * 0.02
+        # Add think token embedding if specified
+        if self.think_token:
+            self.think_embedding = nn.Parameter(torch.randn(1, 1, self.hidden_size) * 0.02)
             
-            if hasattr(self.decoder_model, 'embeddings'):
-                if explain_token_id < self.decoder_model.embeddings.word_embeddings.num_embeddings:
-                    self.decoder_model.embeddings.word_embeddings.weight.data[explain_token_id] = \
-                        self.encoder_model.embeddings.word_embeddings.weight.data[explain_token_id]
-    
-    def encode(self, text: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            
+    def encode(self, inputs: Union[List[Tuple[str, str]], List[Tuple[str, str, bool]]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Encode text to get quantized representations.
         
         Args:
-            text: Input text
+            inputs: Input list of (question, cot) pairs or list of (question, cot, return_cot_only) tuples. Always batched.
             
         Returns:
             Tuple of (quantized_vectors, vq_loss, perplexity)
         """
         # Get representations from frozen encoder
         with torch.no_grad():
-            representations = get_last_layer_representations(
+            representations, tokens, questions = get_last_layer_representations(
                 self.encoder_model,
                 self.tokenizer,
-                text,
-                device="auto"
+                inputs,
+                device="auto",
+                max_length=self.max_length,
+                return_cot_only=self.compress_cot_only
             )
         
-        # Ensure representations is a tensor
-        if isinstance(representations, list):
-            representations = representations[0]  # Take first segment if split
+        quantized, vq_loss, perplexity = [], [], []
+        for i, (representation, token, question) in enumerate(zip(representations, tokens, questions)):
+            # check if encoded representations are split into multiple segments
+            if not isinstance(representation, list):
+                representation = [representation]
+                token = [token]
+            
+            current_quantized, current_vq_loss, current_perplexity = [], [], []
+            # process each segment separately
+            for j, (rep, tok) in enumerate(zip(representation, token)):
+                # Add batch dimension
+                rep = rep.unsqueeze(0)
+                
+                # Apply multi-head attention quantizer
+                quantized_vectors = self.quantizer(rep)
+                
+                # Apply vector quantization
+                _quantized, _vq_loss, _perplexity = self.vq(quantized_vectors)
+                
+                # Append to lists
+                current_quantized.append(_quantized)
+                current_vq_loss.append(_vq_loss)
+                current_perplexity.append(_perplexity)
+            
+            # Stack lists and average across segments
+            quantized.append(torch.stack(current_quantized).mean(dim=0))
+            vq_loss.append(torch.stack(current_vq_loss).mean(dim=0))
+            perplexity.append(torch.stack(current_perplexity).mean(dim=0))
         
-        # Add batch dimension if needed
-        if representations.dim() == 2:
-            representations = representations.unsqueeze(0)
-        
-        # Project to match hidden size if needed
-        if representations.shape[-1] != self.hidden_size:
-            representations = self.projection(representations)
-        
-        # Apply multi-head attention quantizer
-        quantized_vectors = self.quantizer(representations)
-        
-        # Apply vector quantization
-        quantized, vq_loss, perplexity = self.vq(quantized_vectors)
-        
-        return quantized, vq_loss, perplexity
+        return quantized, vq_loss, perplexity, questions, tokens
     
-    def decode(self, quantized_vectors: torch.Tensor, original_text: str) -> torch.Tensor:
+    def decode(self, quantized_vectors: torch.Tensor, original_tokens: List[List[int]], question: str=None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Decode quantized vectors back to text representations.
+        Decode quantized vectors back to text representations and compute reconstruction loss.
+        All vectors belong to the same question.
+        
+        This method assumes the decoder_model is a LlamaForCausalLM and uses its built-in
+        loss computation with the labels argument.
         
         Args:
-            quantized_vectors: Quantized vectors of shape (batch_size, k, hidden_size)
-            original_text: Original text for context
-            
+            original_tokens: Tokenized (potentially splited) original CoT segments for reconstruction
+            question: Question for the CoT
         Returns:
-            Decoded representations
+            Tuple of (decoded_representations, reconstruction_loss)
         """
-        # Get the token IDs for latent tokens
-        latent_token_ids = []
-        for i in range(self.k):
-            token = f"<LATENT_{i}>"
-            if token in self.tokenizer.get_vocab():
-                latent_token_ids.append(self.tokenizer.convert_tokens_to_ids(token))
+        # Start with the quantized vectors as the initial embeddings
+        # These will serve as the "latent token" embeddings
+        input_embeddings = quantized_vectors  # Shape: (batch_size, k, hidden_size)
         
-        explain_token_id = None
-        if self.explain_token in self.tokenizer.get_vocab():
-            explain_token_id = self.tokenizer.convert_tokens_to_ids(self.explain_token)
+        # Add explain token embedding if specified
+        if self.explain_token:
+            # Expand explain embedding to match batch size
+            explain_embedding = self.explain_embedding.expand(input_embeddings.shape[0], 1, self.hidden_size)
+            input_embeddings = torch.cat([input_embeddings, explain_embedding], dim=1)
         
-        # Create input sequence: [LATENT_0, LATENT_1, ..., LATENT_k-1, EXPLAIN, original_text]
-        input_tokens = latent_token_ids[:self.k]
-        if explain_token_id is not None:
-            input_tokens.append(explain_token_id)
+        if self.think_token:
+            think_embedding = self.think_embedding.expand(input_embeddings.shape[0], 1, self.hidden_size)
+            input_embeddings = torch.cat([think_embedding, input_embeddings], dim=1)
         
-        # Add original text tokens
-        original_tokens = self.tokenizer.encode(original_text, add_special_tokens=False)
-        input_tokens.extend(original_tokens)
+        embed_layer = self.decoder_model.get_input_embeddings()
+        device = quantized_vectors.device
+        ctx = torch.enable_grad() if self.train_decoder else torch.no_grad()
         
-        # Convert to tensor and add batch dimension
-        input_ids = torch.tensor([input_tokens], device=quantized_vectors.device)
+        if self.previous_segments_mode == "text":
+            # Extract previous segments from original_tokens
+            previous_embeddings = None
+            if len(original_tokens) > 1:
+                # Add previous segments' token embeddings
+                # the first segment does not have previous segments, so we skip it
+                for segment_tokens, input_embedding in zip(original_tokens[:-1], input_embeddings[1:]): 
+                    with ctx:
+                        new_embedding = embed_layer(
+                            torch.tensor(segment_tokens, device=device).int())
+                    if previous_embeddings is None:
+                        previous_embeddings = new_embedding
+                    else:
+                        previous_embeddings = torch.cat([previous_embeddings, new_embedding], dim=0)
+                    input_embedding = torch.cat([previous_embeddings, input_embedding], dim=0)
+
         
-        # Run decoder model
-        with torch.no_grad():
-            outputs = self.decoder_model(
-                input_ids=input_ids,
-                output_hidden_states=True
+        elif self.previous_segments_mode == "latent":
+            # Extract previous segments from quantized_vectors
+            previous_embeddings = None
+            if len(quantized_vectors) > 1:
+                # Add previous segments' latent quantized vectors
+                # the first segment does not have previous segments, so we skip it
+                for segment_embeddings, input_embedding in zip(quantized_vectors[:-1], input_embeddings[1:]): 
+                    if previous_embeddings is None:
+                        previous_embeddings = segment_embeddings
+                    else:
+                        previous_embeddings = torch.cat([previous_embeddings, segment_embeddings], dim=0)
+                    input_embedding = torch.cat([previous_embeddings, input_embedding], dim=0)
+        
+        else:
+            raise ValueError(f"Invalid previous segments mode: {self.previous_segments_mode}")
+        
+        # Add question embedding if specified
+        if question:
+            question_tokens = self.tokenizer.encode(question, add_special_tokens=False)
+            with ctx:
+                question_embeddings = embed_layer(
+                    torch.tensor(question_tokens, device=device).int())
+            for input_embedding in input_embeddings:
+                input_embedding = torch.cat([question_embeddings, input_embedding], dim=0)
+        
+        # Add prompt embeddings if specified
+        if self.prompt:
+            prompt_tokens = self.tokenizer.encode(self.prompt, add_special_tokens=False)
+            with ctx:
+                prompt_embeddings = embed_layer(
+                    torch.tensor(prompt_tokens, device=device).int())
+            for input_embedding in input_embeddings:
+                input_embedding = torch.cat([prompt_embeddings, input_embedding], dim=0)
+        
+        # create labels
+        labels = [[-100] * len(input_embedding) for input_embedding in input_embeddings]
+
+        # Add original text embeddings
+        with ctx:
+            original_embeddings = embed_layer(
+                torch.tensor(original_tokens, device=device).int())
+        for input_embedding, original_embedding, original_token, label in \
+                zip(input_embeddings, original_embeddings, original_tokens, labels):
+            input_embedding = torch.cat([original_embedding, input_embedding], dim=0)
+            # add original tokens to labels
+            label += original_token
+        
+        # pad sequences to the same length and create attention mask
+        max_length = min(max([len(input_embedding) for input_embedding in input_embeddings]), self.max_length)
+        padded_input_embeddings = []
+        attention_mask = []
+        for input_embedding, label in zip(input_embeddings, labels):
+            num_pad = max_length - len(input_embedding)
+            # pad input embeddings
+            with ctx:
+                pad_embeddings = embed_layer(
+                    torch.tensor([self.tokenizer.pad_token_id] * num_pad, device=device).int())
+            padded_input_embeddings.append(torch.cat([input_embedding, pad_embeddings], dim=0))
+            # create attention mask for padded input embeddings
+            attention_mask.append(torch.cat([torch.ones(len(input_embedding), device=device), 
+                                             torch.zeros(num_pad, device=device)], dim=0))
+            # update labels
+            label += [-100] * num_pad
+        
+        # stack padded input embeddings and attention mask
+        padded_input_embeddings = torch.stack(padded_input_embeddings)
+        attention_mask = torch.stack(attention_mask)
+        labels = torch.tensor(labels, device=device, dtype=torch.long)
+        
+        # Run decoder model with custom embeddings and labels using inputs_embeds argument
+        # This bypasses the embedding layer and directly uses our custom embeddings
+        # LlamaForCausalLM will automatically compute the loss when labels are provided
+        with ctx:
+            model_outputs = self.decoder_model(
+                inputs_embeds=padded_input_embeddings,
+                attention_mask=attention_mask,
+                labels=labels,
+                output_attentions=False,
+                return_dict=True
             )
-        
-        # Return the last hidden states
-        return outputs.hidden_states[-1]
+        # Return the reconstruction loss average across segments
+        return model_outputs.loss
     
-    def forward(self, text: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    
+    def forward(self, inputs: Union[List[Tuple[str, str]], List[Tuple[str, str, bool]]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass through the VQ-VAE.
         
         Args:
-            text: Input text
+            inputs: Input list of (question, cot) pairs or list of (question, cot, return_cot_only) tuples. Always batched.
             
         Returns:
-            Tuple of (quantized_vectors, vq_loss, perplexity, decoded_representations)
+            Tuple of (quantized_vectors, vq_loss, perplexity, decoded_representations, reconstruction_loss, total_loss)
         """
         # Encode
-        quantized, vq_loss, perplexity = self.encode(text)
+        quantized, vq_loss, perplexity, questions, tokens = self.encode(inputs)
         
         # Decode
-        decoded = self.decode(quantized, text)
+        reconstruction_losses = []
+        for i, (quantized, token, question) in enumerate(zip(quantized, tokens, questions)):
+            recon_loss = self.decode(quantized, token, question)
+            reconstruction_losses.append(recon_loss)
         
-        return quantized, vq_loss, perplexity, decoded
+        # Average the losses across the batch
+        avg_reconstruction_loss = torch.stack(reconstruction_losses).mean()
+        avg_vq_loss = torch.stack(vq_loss).mean()
+        avg_perplexity = torch.stack(perplexity).mean()
+        
+        # Compute the final VQ-VAE loss function
+        # Combine VQ loss and reconstruction loss
+        # VQ loss includes commitment loss and codebook loss
+        # Reconstruction loss measures how well the model reconstructs the original tokens
+        total_loss = avg_vq_loss + avg_reconstruction_loss
+        
+        return quantized, avg_vq_loss, avg_perplexity, avg_reconstruction_loss, total_loss
     
-    def get_latent_tokens(self) -> List[str]:
-        """Get the list of latent token strings."""
-        return [f"<LATENT_{i}>" for i in range(self.num_latent_tokens)]
+        
+    def save_checkpoint(self, checkpoint_path: str):
+        """
+        Save checkpoint with trained components and configuration.
+        
+        Args:
+            checkpoint_path: Path to save the checkpoint
+        """
+        checkpoint_dir = os.path.dirname(checkpoint_path)
+        if checkpoint_dir and not os.path.exists(checkpoint_dir):
+            os.makedirs(checkpoint_dir, exist_ok=True)
+
+        # Save configuration and trained components
+        checkpoint_data = {
+            'config': {
+                'num_latent_tokens': self.num_latent_tokens,
+                'num_heads': self.num_heads,
+                'k': self.k,
+                'commitment_cost': self.commitment_cost,
+                'explain_token': self.explain_token,
+                'think_token': self.think_token,
+                'pretrained_model_name': self.pretrained_model_name,
+                'prompt': self.prompt,
+                'compress_cot_only': self.compress_cot_only,
+                'max_length': self.max_length,
+                'train_decoder': self.train_decoder,
+                'previous_segments_mode': self.previous_segments_mode
+            },
+            'trained_components': {
+                'quantizer_state_dict': self.quantizer.state_dict(),
+                'vq_state_dict': self.vq.state_dict(),
+            },
+            'tokenizer': self.tokenizer
+        }
+        
+        # Add explain embedding if it exists
+        if hasattr(self, 'explain_embedding'):
+            checkpoint_data['trained_components']['explain_embedding'] = self.explain_embedding.data
+        
+        # Add thinking embedding if it exists
+        if hasattr(self, 'think_embedding'):
+            checkpoint_data['trained_components']['think_embedding'] = self.think_embedding.data
+        
+        torch.save(checkpoint_data, checkpoint_path)
+        
+        print(f"Checkpoint saved to: {checkpoint_path}")
     
-    def get_explain_token(self) -> str:
-        """Get the explain token string."""
-        return self.explain_token
+    def load_from_checkpoint(self, checkpoint_path: str, pretrained_model_name: str = None):
+        """
+        Load VQVAETextReconstructor from a saved checkpoint.
+        
+        Args:
+            checkpoint_path: Path to the saved checkpoint
+            pretrained_model_name: Optional override for the pretrained model name
+            
+        Returns:
+            Loaded VQVAETextReconstructor instance
+        """
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        # Extract configuration
+        config = checkpoint['config']
+        pretrained_model_name = pretrained_model_name or config['pretrained_model_name']
+        
+        # Get all config parameters
+        model_kwargs = {
+            'num_latent_tokens': config['num_latent_tokens'],
+            'num_heads': config['num_heads'],
+            'k': config['k'],
+            'commitment_cost': config['commitment_cost'],
+            'explain_token': config['explain_token'],
+            'think_token': config['think_token'],
+            'pretrained_model_name': pretrained_model_name,
+            'prompt': config.get('prompt', None),
+            'compress_cot_only': config.get('compress_cot_only', True),
+            'max_length': config.get('max_length', 512),
+            'train_decoder': config.get('train_decoder', False),
+            'previous_segments_mode': config.get('previous_segments_mode', 'text')
+        }
+        
+        # Create model instance
+        model = VQVAETextReconstructor(**model_kwargs)
+        
+        # Load trained components
+        trained_components = checkpoint['trained_components']
+        
+        # Load quantizer state
+        if 'quantizer_state_dict' in trained_components:
+            model.quantizer.load_state_dict(trained_components['quantizer_state_dict'])
+        
+        # Load VQ state
+        if 'vq_state_dict' in trained_components:
+            model.vq.load_state_dict(trained_components['vq_state_dict'])
+        
+        # Load explain embedding if available
+        if 'explain_embedding' in trained_components:
+            model.explain_embedding = nn.Parameter(trained_components['explain_embedding'])
+        
+        # Load thinking embedding if available
+        if 'think_embedding' in trained_components:
+            model.think_embedding = nn.Parameter(trained_components['think_embedding'])
+        
+        print(f"Model loaded from checkpoint: {checkpoint_path}")
+        print(f"Pretrained model: {pretrained_model_name}")
+        print(f"Configuration: {config}")
+        
+        return model
+    
+    def get_checkpoint_info(self) -> dict:
+        """Get information about the current model configuration and components."""
+        return {
+            'config': {
+                'num_latent_tokens': self.num_latent_tokens,
+                'num_heads': self.num_heads,
+                'k': self.k,
+                'commitment_cost': self.commitment_cost,
+                'explain_token': self.explain_token,
+                'think_token': self.think_token,
+                'pretrained_model_name': self.pretrained_model_name,
+                'prompt': self.prompt,
+                'compress_cot_only': self.compress_cot_only,
+                'max_length': self.max_length,
+                'train_decoder': self.train_decoder,
+                'previous_segments_mode': self.previous_segments_mode
+            },
+            'model_info': {
+                'encoder_model_type': type(self.encoder_model).__name__,
+                'decoder_model_type': type(self.decoder_model).__name__,
+                'tokenizer_type': type(self.tokenizer).__name__,
+                'vocabulary_size': len(self.tokenizer.get_vocab()),
+            }
+        }
+    
+    def get_model_size_info(self) -> dict:
+        """Get information about the model size and components."""
+        total_params = 0
+        trainable_params = 0
+        frozen_params = 0
+        
+        # Count parameters in each component
+        quantizer_params = sum(p.numel() for p in self.quantizer.parameters())
+        vq_params = sum(p.numel() for p in self.vq.parameters())
+        
+        # Count encoder parameters (frozen)
+        encoder_params = sum(p.numel() for p in self.encoder_model.parameters())
+        
+        # Count decoder parameters
+        decoder_params = sum(p.numel() for p in self.decoder_model.parameters())
+        if not self.train_decoder:
+            frozen_params += decoder_params
+        else:
+            trainable_params += decoder_params
+        
+        # Count custom embeddings
+        custom_embedding_params = 0
+        if hasattr(self, 'explain_embedding'):
+            custom_embedding_params += self.explain_embedding.numel()
+        if hasattr(self, 'think_embedding'):
+            custom_embedding_params += self.think_embedding.numel()
+        
+        # All our custom components are trainable
+        trainable_params += quantizer_params + vq_params + custom_embedding_params
+        frozen_params += encoder_params
+        
+        total_params = trainable_params + frozen_params
+        
+        return {
+            'total_parameters': total_params,
+            'trainable_parameters': trainable_params,
+            'frozen_parameters': frozen_params,
+            'component_parameters': {
+                'quantizer': quantizer_params,
+                'vector_quantizer': vq_params,
+                'encoder_model': encoder_params,
+                'decoder_model': decoder_params,
+                'custom_embeddings': custom_embedding_params,
+            },
+            'model_size_mb': total_params * 4 / (1024 * 1024),  # Assuming float32
+            'trainable_size_mb': trainable_params * 4 / (1024 * 1024),
+            'frozen_size_mb': frozen_params * 4 / (1024 * 1024)
+        }
+    
+    def get_trainable_parameters(self) -> dict:
+        """
+        Get detailed information about all trainable parameters in the model.
+        
+        Returns:
+            Dictionary containing trainable parameter information
+        """
+        trainable_params = {}
+        
+        # Quantizer parameters
+        quantizer_params = {}
+        for name, param in self.quantizer.named_parameters():
+            if param.requires_grad:
+                quantizer_params[name] = {
+                    'shape': list(param.shape),
+                    'numel': param.numel(),
+                    'dtype': str(param.dtype),
+                    'device': str(param.device)
+                }
+        trainable_params['quantizer'] = quantizer_params
+        
+        # Vector quantizer parameters
+        vq_params = {}
+        for name, param in self.vq.named_parameters():
+            if param.requires_grad:
+                vq_params[name] = {
+                    'shape': list(param.shape),
+                    'numel': param.numel(),
+                    'dtype': str(param.dtype),
+                    'device': str(param.device)
+                }
+        trainable_params['vector_quantizer'] = vq_params
+        
+        # Custom embeddings
+        custom_embeddings = {}
+        if hasattr(self, 'explain_embedding') and self.explain_embedding.requires_grad:
+            custom_embeddings['explain_embedding'] = {
+                'shape': list(self.explain_embedding.shape),
+                'numel': self.explain_embedding.numel(),
+                'dtype': str(self.explain_embedding.dtype),
+                'device': str(self.explain_embedding.device)
+            }
+        
+        if hasattr(self, 'think_embedding') and self.think_embedding.requires_grad:
+            custom_embeddings['think_embedding'] = {
+                'shape': list(self.think_embedding.shape),
+                'numel': self.think_embedding.numel(),
+                'dtype': str(self.think_embedding.dtype),
+                'device': str(self.think_embedding.device)
+            }
+        
+        if custom_embeddings:
+            trainable_params['custom_embeddings'] = custom_embeddings
+        
+        # Decoder parameters (if training)
+        if self.train_decoder:
+            decoder_params = {}
+            for name, param in self.decoder_model.named_parameters():
+                if param.requires_grad:
+                    decoder_params[name] = {
+                        'shape': list(param.shape),
+                        'numel': param.numel(),
+                        'dtype': str(param.dtype),
+                        'device': str(param.device)
+                    }
+            trainable_params['decoder_model'] = decoder_params
+        
+        return trainable_params
+    
+    def get_all_parameters_summary(self) -> dict:
+        """
+        Get a comprehensive summary of all parameters in the model.
+        
+        Returns:
+            Dictionary containing complete parameter information
+        """
+        all_params = {}
+        
+        # Quantizer parameters
+        quantizer_params = {}
+        for name, param in self.quantizer.named_parameters():
+            quantizer_params[name] = {
+                'shape': list(param.shape),
+                'numel': param.numel(),
+                'dtype': str(param.dtype),
+                'device': str(param.device),
+                'requires_grad': param.requires_grad
+            }
+        all_params['quantizer'] = quantizer_params
+        
+        # Vector quantizer parameters
+        vq_params = {}
+        for name, param in self.vq.named_parameters():
+            vq_params[name] = {
+                'shape': list(param.shape),
+                'numel': param.numel(),
+                'dtype': str(param.dtype),
+                'device': str(param.device),
+                'requires_grad': param.requires_grad
+            }
+        all_params['vector_quantizer'] = vq_params
+        
+        # Encoder model parameters (all frozen)
+        encoder_params = {}
+        for name, param in self.encoder_model.named_parameters():
+            encoder_params[name] = {
+                'shape': list(param.shape),
+                'numel': param.numel(),
+                'dtype': str(param.dtype),
+                'device': str(param.device),
+                'requires_grad': param.requires_grad
+            }
+        all_params['encoder_model'] = encoder_params
+        
+        # Decoder model parameters
+        decoder_params = {}
+        for name, param in self.decoder_model.named_parameters():
+            decoder_params[name] = {
+                'shape': list(param.shape),
+                'numel': param.numel(),
+                'dtype': str(param.dtype),
+                'device': str(param.device),
+                'requires_grad': param.requires_grad
+            }
+        all_params['decoder_model'] = decoder_params
+        
+        # Custom embeddings
+        custom_embeddings = {}
+        if hasattr(self, 'explain_embedding'):
+            custom_embeddings['explain_embedding'] = {
+                'shape': list(self.explain_embedding.shape),
+                'numel': self.explain_embedding.numel(),
+                'dtype': str(self.explain_embedding.dtype),
+                'device': str(self.explain_embedding.device),
+                'requires_grad': self.explain_embedding.requires_grad
+            }
+        
+        if hasattr(self, 'think_embedding'):
+            custom_embeddings['think_embedding'] = {
+                'shape': list(self.think_embedding.shape),
+                'numel': self.think_embedding.numel(),
+                'dtype': str(self.think_embedding.dtype),
+                'device': str(self.think_embedding.device),
+                'requires_grad': self.think_embedding.requires_grad
+            }
+        
+        if custom_embeddings:
+            all_params['custom_embeddings'] = custom_embeddings
+        
+        return all_params
+    
+    def print_parameter_summary(self):
+        """
+        Print a formatted summary of all model parameters.
+        """
+        print("=" * 80)
+        print("VQ-VAE MODEL PARAMETER SUMMARY")
+        print("=" * 80)
+        
+        # Get size info
+        size_info = self.get_model_size_info()
+        print(f"\nMODEL SIZE OVERVIEW:")
+        print(f"  Total Parameters: {size_info['total_parameters']:,}")
+        print(f"  Trainable Parameters: {size_info['trainable_parameters']:,}")
+        print(f"  Frozen Parameters: {size_info['frozen_parameters']:,}")
+        print(f"  Total Size: {size_info['model_size_mb']:.2f} MB")
+        print(f"  Trainable Size: {size_info['trainable_size_mb']:.2f} MB")
+        print(f"  Frozen Size: {size_info['frozen_size_mb']:.2f} MB")
+        
+        # Get detailed parameter info
+        trainable_params = self.get_trainable_parameters()
+        all_params = self.get_all_parameters_summary()
+        
+        print(f"\nTRAINABLE COMPONENTS:")
+        print(f"  {'Component':<20} {'Parameters':<12} {'Size (MB)':<12}")
+        print(f"  {'-'*20} {'-'*12} {'-'*12}")
+        
+        for component, params in trainable_params.items():
+            if params:  # Only show components with parameters
+                total_params = sum(p['numel'] for p in params.values())
+                size_mb = total_params * 4 / (1024 * 1024)
+                print(f"  {component:<20} {total_params:<12,} {size_mb:<12.2f}")
+        
+        print(f"\nFROZEN COMPONENTS:")
+        print(f"  {'Component':<20} {'Parameters':<12} {'Size (MB)':<12}")
+        print(f"  {'-'*20} {'-'*12} {'-'*12}")
+        
+        # Show frozen components
+        frozen_components = ['encoder_model']
+        if not self.train_decoder:
+            frozen_components.append('decoder_model')
+        
+        for component in frozen_components:
+            if component in all_params:
+                total_params = sum(p['numel'] for p in all_params[component].values())
+                size_mb = total_params * 4 / (1024 * 1024)
+                print(f"  {component:<20} {total_params:<12,} {size_mb:<12.2f}")
+        
+        print(f"\nDETAILED PARAMETER BREAKDOWN:")
+        for component, params in all_params.items():
+            if params:
+                print(f"\n  {component.upper()}:")
+                total_params = sum(p['numel'] for p in params.values())
+                trainable_params_count = sum(p['numel'] for p in params.values() if p['requires_grad'])
+                print(f"    Total: {total_params:,} parameters")
+                print(f"    Trainable: {trainable_params_count:,} parameters")
+                print(f"    Frozen: {total_params - trainable_params_count:,} parameters")
+                
+                # Show top 5 largest parameter tensors
+                sorted_params = sorted(params.items(), key=lambda x: x[1]['numel'], reverse=True)
+                for name, param_info in sorted_params[:5]:
+                    status = "✓" if param_info['requires_grad'] else "✗"
+                    print(f"      {status} {name}: {param_info['shape']} ({param_info['numel']:,})")
+        
+        print("=" * 80)
 
 
-def create_vq_vae_model(
-    model_name: str,
-    num_latent_tokens: int,
-    k: int,
-    num_heads: int = 8,
-    commitment_cost: float = 0.25,
-    explain_token: str = "<EXPLAIN>"
-) -> VQVAETextReconstructor:
+
+def get_checkpoint_info(checkpoint_path: str) -> dict:
     """
-    Create a VQ-VAE model with the specified configuration.
+    Get information about a saved checkpoint without loading the full model.
     
     Args:
-        model_name: HuggingFace model name or path
-        num_latent_tokens: Number of latent tokens to add
-        k: Number of quantized vectors
-        num_heads: Number of attention heads
-        commitment_cost: Commitment cost for vector quantization
-        explain_token: Token to use as explanation separator
+        checkpoint_path: Path to the checkpoint file
         
     Returns:
-        Configured VQ-VAE model
+        Dictionary containing checkpoint information
     """
-    # Load tokenizer and models
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    encoder_model = AutoModel.from_pretrained(model_name)
-    decoder_model = AutoModel.from_pretrained(model_name)
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     
-    # Get hidden size from model
-    if hasattr(encoder_model, 'config'):
-        hidden_size = encoder_model.config.hidden_size
-    else:
-        # Default hidden size for common models
-        hidden_size = 768
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
     
-    # Create VQ-VAE model
-    model = VQVAETextReconstructor(
-        encoder_model=encoder_model,
-        decoder_model=decoder_model,
-        tokenizer=tokenizer,
-        num_latent_tokens=num_latent_tokens,
-        hidden_size=hidden_size,
-        num_heads=num_heads,
-        k=k,
-        commitment_cost=commitment_cost,
-        explain_token=explain_token
-    )
+    info = {
+        'checkpoint_path': checkpoint_path,
+        'file_size_mb': os.path.getsize(checkpoint_path) / (1024 * 1024),
+        'checkpoint_type': 'full_model' if 'model_state_dict' in checkpoint else 'trained_components_only'
+    }
     
-    return model
+    if 'config' in checkpoint:
+        info['config'] = checkpoint['config']
+    
+    if 'trained_components' in checkpoint:
+        info['trained_components'] = list(checkpoint['trained_components'].keys())
+    
+    return info
+
+
+def demonstrate_checkpoint_workflow():
+    """
+    Comprehensive demonstration of the checkpoint workflow for VQ-VAE.
+    This shows how to save, load, and manage checkpoints in different scenarios.
+    """
+    print("=== VQ-VAE Checkpoint Workflow Demonstration ===\n")
+    
+    try:
+        # 1. Create and train a model (simulated)
+        print("1. Creating VQ-VAE model...")
+        model_name = "../models/OLMo-2-0425-1B-Base"
+        
+        vq_vae = create_vq_vae_model(
+            model_name=model_name,
+            num_latent_tokens=32,
+            k=4,
+            num_heads=4,
+            commitment_cost=0.25
+        )
+        
+        print(f"   ✓ Model created with {vq_vae.num_latent_tokens} latent tokens")
+        print(f"   ✓ Pretrained model: {vq_vae.pretrained_model_name}")
+        
+        # 2. Simulate training (just show the process)
+        print("\n2. Simulating training process...")
+        print("   ✓ Quantizer trained")
+        print("   ✓ Vector quantizer trained")
+        print("   ✓ Latent token embeddings learned")
+        
+        # 3. Save different types of checkpoints
+        print("\n3. Saving different types of checkpoints...")
+        
+        # Lightweight checkpoint (recommended for most use cases)
+        light_checkpoint = "checkpoints/vq_vae_light.pt"
+        vq_vae.save_checkpoint(light_checkpoint, save_full_model=False)
+        print(f"   ✓ Lightweight checkpoint saved: {light_checkpoint}")
+        
+        # Full model checkpoint (for complete state preservation)
+        full_checkpoint = "checkpoints/vq_vae_full.pt"
+        vq_vae.save_checkpoint(full_checkpoint, save_full_model=True)
+        print(f"   ✓ Full model checkpoint saved: {full_checkpoint}")
+        
+        # Minimal latent embeddings checkpoint
+        latent_checkpoint = "checkpoints/vq_vae_latent.pt"
+        vq_vae.save_latent_embeddings_only(latent_checkpoint)
+        print(f"   ✓ Latent embeddings checkpoint saved: {latent_checkpoint}")
+        
+        # Inference export
+        inference_checkpoint = "checkpoints/vq_vae_inference.pt"
+        vq_vae.export_for_inference(inference_checkpoint)
+        print(f"   ✓ Inference model exported: {inference_checkpoint}")
+        
+        # 4. Demonstrate loading from different checkpoints
+        print("\n4. Loading from different checkpoints...")
+        
+        # Load lightweight checkpoint
+        print("   Loading lightweight checkpoint...")
+        light_model = VQVAETextReconstructor.load_from_checkpoint(light_checkpoint)
+        print("   ✓ Lightweight model loaded successfully")
+        
+        # Load full checkpoint
+        print("   Loading full checkpoint...")
+        full_model = VQVAETextReconstructor.load_from_checkpoint(full_checkpoint)
+        print("   ✓ Full model loaded successfully")
+        
+        # Load latent embeddings only
+        print("   Loading latent embeddings...")
+        new_vq_vae = create_vq_vae_model(
+            model_name=model_name,
+            num_latent_tokens=32,
+            k=4,
+            num_heads=4
+        )
+        new_vq_vae.load_latent_embeddings_only(latent_checkpoint)
+        print("   ✓ Latent embeddings loaded successfully")
+        
+        # 5. Test loaded models
+        print("\n5. Testing loaded models...")
+        test_text = "This is a test sentence for checkpoint verification."
+        
+        # Test lightweight model
+        quantized_light, vq_loss_light, perplexity_light, decoded_light, recon_loss_light = light_model(test_text)
+        print(f"   ✓ Lightweight model: VQ loss = {vq_loss_light.item():.4f}, Reconstruction loss = {recon_loss_light.item():.4f}")
+        
+        # Test full model
+        quantized_full, vq_loss_full, perplexity_full, decoded_full, recon_loss_full = full_model(test_text)
+        print(f"   ✓ Full model: VQ loss = {vq_loss_full.item():.4f}, Reconstruction loss = {recon_loss_full.item():.4f}")
+        
+        # Test model with loaded latent embeddings
+        quantized_new, vq_loss_new, perplexity_new, decoded_new, recon_loss_new, total_loss_new = new_vq_vae(test_text)
+        print(f"   ✓ New model with loaded embeddings: VQ loss = {vq_loss_new.item():.4f}, Reconstruction loss = {recon_loss_new.item():.4f}, Total loss = {total_loss_new.item():.4f}")
+        
+        # 6. Checkpoint information and analysis
+        print("\n6. Checkpoint analysis...")
+        
+        # Get info about each checkpoint type
+        light_info = get_checkpoint_info(light_checkpoint)
+        full_info = get_checkpoint_info(full_checkpoint)
+        latent_info = get_checkpoint_info(latent_checkpoint)
+        inference_info = get_checkpoint_info(inference_checkpoint)
+        
+        print(f"   Lightweight checkpoint: {light_info['file_size_mb']:.2f} MB")
+        print(f"   Full checkpoint: {full_info['file_size_mb']:.2f} MB")
+        print(f"   Latent checkpoint: {latent_info['file_size_mb']:.2f} MB")
+        print(f"   Inference checkpoint: {inference_info['file_size_mb']:.2f} MB")
+        
+        # 7. Model information
+        print("\n7. Model information...")
+        size_info = vq_vae.get_model_size_info()
+        print(f"   Total parameters: {size_info['total_parameters']:,}")
+        print(f"   Model size: {size_info['model_size_mb']:.2f} MB")
+        print(f"   Components: {list(size_info['component_parameters'].keys())}")
+        
+        # 8. Cleanup
+        print("\n8. Cleaning up...")
+        import shutil
+        if os.path.exists("checkpoints"):
+            shutil.rmtree("checkpoints")
+        print("   ✓ Checkpoint files cleaned up")
+        
+        print("\n=== Checkpoint Workflow Demonstration Completed Successfully! ===")
+        
+    except Exception as e:
+        print(f"\n❌ Checkpoint workflow demonstration failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 # Example usage
 if __name__ == "__main__":
-    # Example 1: Basic usage
-    text = "Hello world! This is a test sentence."
-    model_name = "../models/OLMo-2-0425-1B-Base"
+    # Run the main demo
+    print("Running VQ-VAE main demo...")
     
-    # Load tokenizer and model
-    print(f"Loading model: {model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name)
-    
-    # Example 3: Split by text delimiters (handles tokenization mismatches)
-    print("\n=== Split by Tokens ===")
-    text_with_splits = "First sentence.\nSecond sentence.\nThird sentence."
-    split_reprs, split_tokens = get_last_layer_representations(
-        model,
-        tokenizer,
-        text_with_splits, 
-        return_tokens=True,
-        split_delimiters=["\n", "."]
-    )
-    print(f"Number of segments: {len(split_reprs)}")
-    for i, (reprs, tokens) in enumerate(zip(split_reprs, split_tokens)):
-        print(f"Segment {i}: {tokens} -> Shape: {reprs.shape}")
-    
-    # Example 4: Split by words that might be tokenized into multiple tokens
-    print("\n=== Split by Multiple Tokens ===")
-    text_multi = "Question: What is AI? Answer: AI is intelligence. Explanation: It's complex."
-    split_reprs, split_tokens = get_last_layer_representations(
-        model,
-        tokenizer,
-        text_multi, 
-        return_tokens=True,
-        split_delimiters=["Question:", "Answer:", "Explanation:"]
-    )
-    print(f"Number of segments: {len(split_reprs)}")
-    for i, (reprs, tokens) in enumerate(zip(split_reprs, split_tokens)):
-        print(f"Segment {i}: {tokens} -> Shape: {reprs.shape}")
-    
-    # Example 5: Demonstrate handling of tokenization mismatches
-    print("\n=== Tokenization Mismatch Handling ===")
-    text_demo = "Hello world! How are you?\nI'm doing great."
-    print(f"Original text: {repr(text_demo)}")
-    # Split by '!' which might be tokenized with the word before it
-    split_reprs, split_tokens = get_last_layer_representations(
-        model,
-        tokenizer,
-        text_demo, 
-        return_tokens=True,
-        split_delimiters=["!", "?", "\n"]
-    )
-    print(f"Number of segments: {len(split_reprs)}")
-    for i, (reprs, tokens) in enumerate(zip(split_reprs, split_tokens)):
-        print(f"Segment {i}: {tokens} -> Shape: {reprs.shape}")
-    
-    # Example 6: Batch processing
-    print("\n=== Batch Processing ===")
-    batch_texts = [
-        "First text. Second sentence.",
-        "Another text with multiple sentences. Here is more content.",
-        "Short text."
-    ]
-    
-    # Process batch without splitting
-    batch_reprs, batch_tokens = get_last_layer_representations(
-        model,
-        tokenizer,
-        batch_texts, 
-        return_tokens=True,
-        split_delimiters=None
-    )
-    print(f"Batch size: {len(batch_reprs)}")
-    for i, (reprs, tokens) in enumerate(zip(batch_reprs, batch_tokens)):
-        print(f"Text {i}: {clean_tokens_for_display(tokens)} -> Shape: {reprs.shape}")
-    
-    # Process batch with splitting
-    batch_split_reprs, batch_split_tokens = get_last_layer_representations(
-        model,
-        tokenizer,
-        batch_texts, 
-        return_tokens=True,
-        split_delimiters=["."]
-    )
-    print(f"\nBatch with splitting:")
-    for i, (text_reprs, text_tokens) in enumerate(zip(batch_split_reprs, batch_split_tokens)):
-        print(f"Text {i}: {len(text_reprs)} segments")
-        for j, (reprs, tokens) in enumerate(zip(text_reprs, text_tokens)):
-            print(f"  Segment {j}: {clean_tokens_for_display(tokens)} -> Shape: {reprs.shape}")
-    
-    # Example 7: Demonstrate BPE token cleaning
-    print("\n=== BPE Token Cleaning Demo ===")
-    demo_text = "Hello world!\nHow are you?"
-    print(f"Original text: {repr(demo_text)}")
-    
-    demo_reprs, demo_tokens = get_last_layer_representations(
-        model, 
-        tokenizer, 
-        demo_text, 
-        return_tokens=True,
-        split_delimiters=None
-    )
-    
-    print(f"Raw BPE tokens: {demo_tokens}")
-    print(f"Clean tokens: {clean_tokens_for_display(demo_tokens)}")
-    
-    # Show what each special character means
-    print(f"\nBPE Character Meanings:")
-    print(f"Ġ -> space character")
-    print(f"Ċ -> newline character") 
-    print(f"▁ -> space character (SentencePiece)")
-    
-    # Alternative: Use tokenizer's built-in method
-    clean_text = tokenizer.convert_tokens_to_string(demo_tokens)
-    print(f"Tokenizer clean text: {repr(clean_text)}")
-    
-    # Example 8: VQ-VAE usage
+    # Example 13: VQ-VAE usage
     print("\n=== VQ-VAE Demo ===")
     try:
         # Create VQ-VAE model
-        vq_vae = create_vq_vae_model(
-            model_name=model_name,
+        vq_vae = VQVAETextReconstructor(
+            pretrained_model_name="../models/OLMo-2-0425-1B-Base",
             num_latent_tokens=64,  # 64 latent tokens
             k=8,                   # 8 quantized vectors
             num_heads=8,           # 8 attention heads
@@ -734,9 +888,7 @@ if __name__ == "__main__":
         print(f"  - {vq_vae.num_latent_tokens} latent tokens")
         print(f"  - {vq_vae.k} quantized vectors")
         print(f"  - {vq_vae.hidden_size} hidden size")
-        print(f"  - Latent tokens: {vq_vae.get_latent_tokens()[:5]}...")
-        print(f"  - Explain token: {vq_vae.get_explain_token()}")
-        
+
         # Test encoding and decoding
         test_text = "This is a test sentence for VQ-VAE."
         print(f"\nTesting with text: {test_text}")
@@ -748,13 +900,103 @@ if __name__ == "__main__":
         print(f"Perplexity: {perplexity.item():.2f}")
         
         # Decode
-        decoded = vq_vae.decode(quantized, test_text)
+        decoded, recon_loss = vq_vae.decode(quantized, test_text)
         print(f"Decoded shape: {decoded.shape}")
+        print(f"Reconstruction loss: {recon_loss.item():.4f}")
         
         # Full forward pass
-        quantized, vq_loss, perplexity, decoded = vq_vae(test_text)
+        quantized, vq_loss, perplexity, decoded, recon_loss, total_loss = vq_vae(test_text)
         print(f"Full forward pass completed successfully!")
+        print(f"Average reconstruction loss: {recon_loss.item():.4f}")
+        print(f"Total VQ-VAE loss: {total_loss.item():.4f}")
+        
+        # Demonstrate checkpoint functionality
+        print(f"\n=== Checkpoint Demo ===")
+        
+        # Save checkpoint with only trained components (recommended)
+        checkpoint_path = "vq_vae_checkpoint.pt"
+        vq_vae.save_checkpoint(checkpoint_path, save_full_model=False)
+        print(f"Saved lightweight checkpoint to: {checkpoint_path}")
+        
+        # Get checkpoint info
+        checkpoint_info = vq_vae.get_checkpoint_info()
+        print(f"Checkpoint info: {checkpoint_info}")
+        
+        # Load from checkpoint
+        print(f"\nLoading from checkpoint...")
+        loaded_vq_vae = VQVAETextReconstructor.load_from_checkpoint(checkpoint_path)
+        
+        # Test loaded model
+        test_text_loaded = "Testing the loaded model with this sentence."
+        quantized_loaded, vq_loss_loaded, perplexity_loaded, decoded_loaded, recon_loss_loaded, total_loss_loaded = loaded_vq_vae(test_text_loaded)
+        print(f"Loaded model test successful!")
+        print(f"  - VQ loss: {vq_loss_loaded.item():.4f}")
+        print(f"  - Perplexity: {perplexity_loaded.item():.2f}")
+        print(f"  - Reconstruction loss: {recon_loss_loaded.item():.4f}")
+        print(f"  - Total loss: {total_loss_loaded.item():.4f}")
+        
+        # Demonstrate full model saving (for complete state preservation)
+        full_checkpoint_path = "vq_vae_full_checkpoint.pt"
+        vq_vae.save_checkpoint(full_checkpoint_path, save_full_model=True)
+        print(f"Saved full checkpoint to: {full_checkpoint_path}")
+        
+        # Load full checkpoint
+        print(f"\nLoading from full checkpoint...")
+        loaded_full_vq_vae = VQVAETextReconstructor.load_from_checkpoint(full_checkpoint_path)
+        
+        # Test full loaded model
+        test_text_full = "Testing the fully loaded model."
+        quantized_full, vq_loss_full, perplexity_full, decoded_full, recon_loss_full, total_loss_full = loaded_full_vq_vae(test_text_full)
+        print(f"Full model test successful!")
+        print(f"  - VQ loss: {vq_loss_full.item():.4f}")
+        print(f"  - Perplexity: {perplexity_full.item():.2f}")
+        print(f"  - Reconstruction loss: {recon_loss_full.item():.4f}")
+        print(f"  - Total loss: {total_loss_full.item():.4f}")
+        
+        # Clean up checkpoint files
+        if os.path.exists(checkpoint_path):
+            os.remove(checkpoint_path)
+        if os.path.exists(full_checkpoint_path):
+            os.remove(full_checkpoint_path)
+        print(f"\nCleaned up checkpoint files.")
+        
+        # Demonstrate additional checkpoint features
+        print(f"\n=== Additional Checkpoint Features ===")
+        
+        # Show model size information
+        size_info = vq_vae.get_model_size_info()
+        print(f"Model size info: {size_info}")
+        
+        # Save minimal latent embeddings checkpoint
+        latent_checkpoint_path = "vq_vae_latent_only.pt"
+        vq_vae.save_latent_embeddings_only(latent_checkpoint_path)
+        
+        # Export for inference
+        inference_path = "vq_vae_inference.pt"
+        vq_vae.export_for_inference(inference_path)
+        
+        # Get checkpoint info without loading
+        checkpoint_info = get_checkpoint_info(latent_checkpoint_path)
+        print(f"Latent checkpoint info: {checkpoint_info}")
+        
+        inference_info = get_checkpoint_info(inference_path)
+        print(f"Inference checkpoint info: {inference_info}")
+        
+        # Test loading latent embeddings only
+        print(f"\nTesting latent embeddings loading...")
+        vq_vae.load_latent_embeddings_only(latent_checkpoint_path)
+        print(f"Latent embeddings loaded successfully!")
+        
+        # Clean up additional files
+        if os.path.exists(latent_checkpoint_path):
+            os.remove(latent_checkpoint_path)
+        if os.path.exists(inference_path):
+            os.remove(inference_path)
+        print(f"Cleaned up additional checkpoint files.")
         
     except Exception as e:
         print(f"VQ-VAE demo failed: {e}")
         print("This might be due to model compatibility or missing dependencies.")
+    
+    # Uncomment the line below to run the comprehensive checkpoint workflow demo
+    # demonstrate_checkpoint_workflow()
