@@ -37,11 +37,11 @@ class MultiHeadAttentionQuantizer(nn.Module):
         # Layer normalization
         self.layer_norm = nn.LayerNorm(hidden_size)
         
-    def forward(self, representations: torch.Tensor) -> torch.Tensor:
+    def forward(self, representations: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """
         Args:
             representations: Input representations of shape (batch_size, seq_len, hidden_size)
-            
+            attention_mask: Attention mask of shape (batch_size, seq_len)
         Returns:
             Quantized vectors of shape (batch_size, k, hidden_size)
         """
@@ -59,7 +59,8 @@ class MultiHeadAttentionQuantizer(nn.Module):
             attended_output, _ = self.attention_layers[i](
                 query=query,
                 key=representations,
-                value=representations
+                value=representations,
+                attn_mask=attention_mask
             )
             
             # Apply output projection
@@ -99,7 +100,7 @@ class VectorQuantizer(nn.Module):
             inputs: Input vectors of shape (batch_size, k, embedding_dim)
             
         Returns:
-            Tuple of (quantized, loss, perplexity)
+            Tuple of (quantized, loss, perplexity, encoding_indices)
         """
         # Reshape inputs for easier processing
         batch_size, k, embedding_dim = inputs.shape
@@ -128,7 +129,7 @@ class VectorQuantizer(nn.Module):
         avg_probs = torch.mean(encodings, dim=0)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
         
-        return quantized, loss, perplexity
+        return quantized, loss, perplexity, encoding_indices
 
 
 def clean_tokens_for_display(tokens: List[str]) -> List[str]:
@@ -164,7 +165,12 @@ def get_last_layer_representations(
 ) -> Union[Tuple[List[List[torch.Tensor]], List[List[List[str]]], List[str]], 
            Tuple[List[List[torch.Tensor]], List[List[List[str]]]],
            Tuple[List[List[torch.Tensor]], List[List[List[int]]], List[str]], 
-           Tuple[List[List[torch.Tensor]], List[List[List[int]]]]]:
+           Tuple[List[List[torch.Tensor]], List[List[List[int]]]],
+           Tuple[List[torch.Tensor], List[List[str]], List[str]], 
+           Tuple[List[torch.Tensor], List[List[str]]],
+           Tuple[List[torch.Tensor], List[List[int]], List[str]], 
+           Tuple[List[torch.Tensor], List[List[int]]]
+           ]:
     """
     Extract the last layer representations from a Hugging Face pretrained language model.
     
@@ -175,7 +181,7 @@ def get_last_layer_representations(
             - Single string input
             - List of (question, cot) pairs
             - List of (question, cot, return_cot_only) tuples where return_cot_only overrides the global parameter
-        device (str): Device to run the model on ("auto", "cpu", "cuda", or specific device)
+        device (str): Device to run the model on ("cpu", "cuda", or specific device)
         max_length (int): Maximum sequence length for tokenization
         return_token_text (bool): Whether to return token text (True) or token indices (False)
         split_delimiters (List[str]): List of text delimiters to split on (e.g., ["\n", ".", "Answer:"])
@@ -250,17 +256,6 @@ def get_last_layer_representations(
             cot_only_flags = [False]
             concatenated_texts = [text]
             original_texts = [text]
-    
-    # Auto-detect device if specified
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    # Move model to device
-    model = model.to(device)
-    model.eval()
-    
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
     
     # Tokenize the input texts
     inputs = tokenizer(
