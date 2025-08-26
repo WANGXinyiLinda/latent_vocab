@@ -99,8 +99,7 @@ class VQVAETextReconstructor(nn.Module):
         # Add think token embedding if specified
         if self.think_token:
             self.think_embedding = nn.Parameter(
-                torch.randn(1, 1, self.hidden_size) * 0.02).to(device)
-            
+                torch.randn(1, 1, self.hidden_size) * 0.02).to(device)        
             
     def encode(self, 
                inputs: Union[List[Tuple[str, str]], List[Tuple[str, str, bool]]]
@@ -143,20 +142,17 @@ class VQVAETextReconstructor(nn.Module):
                 all_tokens.append(tok)
                 all_questions.append(question)
                 # build segment groups
-                segment_groups.append(i)            
-        # pad sequences to the same length and create attention mask
-        input_embeddings = self.encoder_model.get_input_embeddings()
-        max_length = min(max([len(input_representation) for input_representation in all_inputs]), self.max_length)
+                segment_groups.append(i)
                 
+        # pad sequences to the same length and create attention mask
+        max_length = min(max([len(input_representation) for input_representation in all_inputs]), self.max_length)        
         padded_inputs = []
         attention_mask = []
         for input_representation in all_inputs:
             num_pad = max_length - len(input_representation)
             # pad input embeddings
             with torch.no_grad():
-                pad_embeddings = input_embeddings(
-                    torch.tensor([self.tokenizer.pad_token_id] * num_pad, device=self.device).int()
-                )
+                pad_embeddings = torch.zeros(num_pad, self.hidden_size, device=self.device)
             padded_inputs.append(torch.cat([input_representation, pad_embeddings], dim=0))
             # create attention mask for padded input embeddings
             attention_mask.append(torch.cat(
@@ -178,7 +174,7 @@ class VQVAETextReconstructor(nn.Module):
     
     def decode(self, 
                quantized_vectors: torch.Tensor, 
-               original_tokens: List[List[List[int]]], 
+               original_tokens: List[List[int]], 
                questions: List[str]=None,
                segment_groups: List[int]=None,
                batch_order: str = "length" # "random", "length", or "none"
@@ -214,95 +210,107 @@ class VQVAETextReconstructor(nn.Module):
         embed_layer = self.decoder_model.get_input_embeddings()
         ctx = torch.enable_grad() if self.train_decoder else torch.no_grad()
         
+        # Pre-compute all token embeddings to avoid repeated lookups
+        all_tokens = []
+        # Collect all tokens that need embedding
+        if self.prompt:
+            all_tokens.append(self.prompt)  # Prompt (only one)
+            
+        if questions:
+            all_tokens.extend(questions)  # Questions
+        
+        all_tokens.extend(original_tokens)  # Original tokens
+        
+        # Batch embed all tokens at once (major speedup)
+        token_embeddings = []
+        with ctx:
+            if all_tokens:
+                # Create a single tensor with all tokens for batch embedding
+                token_lengths = [len(tokens) for tokens in all_tokens]
+                max_token_len = max(token_lengths) if token_lengths else 0
+                
+                if max_token_len > 0:
+                    # Pad tokens to same length for batch processing
+                    padded_tokens = []
+                    for tokens in all_tokens:
+                        padded = tokens + [self.tokenizer.pad_token_id] * (max_token_len - len(tokens))
+                        padded_tokens.append(padded)
+                    
+                    # Batch embed all tokens
+                    all_token_tensor = torch.tensor(padded_tokens, device=self.device).int()
+                    all_embeddings = embed_layer(all_token_tensor)
+                    
+                    # Unpack embeddings back to original lengths
+                    start_idx = 0
+                    for length in token_lengths:
+                        token_embeddings.append(all_embeddings[start_idx:start_idx + length])
+                        start_idx += 1
+        
+        # upack token embeddings for prompt, questions, and original tokens
+        prompt_embedding, question_embeddings, original_embeddings, previous_segments_embeddings = None, [], [], []                
+        if self.prompt:
+            prompt_embedding = token_embeddings[0]
+            if questions:
+                question_embeddings = token_embeddings[1:len(questions)+1]
+        elif questions:
+                question_embeddings = token_embeddings[:len(questions)]
+        original_embeddings = token_embeddings[-len(original_tokens):]
+        
+        # build previous segments embeddings from original token embeddings or quantized vectors
+        if self.previous_segments_mode == "text" and len(original_tokens) > 1:
+            segments_embeddings = original_embeddings
+        elif self.previous_segments_mode == "latent" and len(quantized_vectors) > 1:
+            segments_embeddings = quantized_vectors
+        else:
+            segments_embeddings = []
+        
+        # concatenate previous segments embeddings for each segment inside the same group
         prev_group = None
-        previous_embeddings = None
-        # Build modified embeddings while preserving gradients
+        previous_segments_embeddings = torch.Tensor([], 
+                            device=self.device, dtype=input_embeddings[0].dtype)
+        for group, segment_embedding in zip(segment_groups, segments_embeddings):
+            if group != prev_group:
+                previous_segments_embeddings.append(None)
+                previous_segments_embedding = segment_embedding
+                prev_group = group
+            else:
+                previous_segments_embedding = torch.cat([previous_segments_embedding, segment_embedding], dim=0)
+                previous_segments_embeddings.append(previous_segments_embedding)
+
+        # Build modified embeddings efficiently
         modified_embeddings = []
         labels = []
         
-        if self.previous_segments_mode == "text":
-            # Extract previous segments from original_tokens
-            if len(original_tokens) > 1:
-                # Add previous segments' token embeddings
-                # the first segment does not have previous segments, so we skip it
-                for i, (group, segment_tokens, input_embedding) in enumerate(zip(segment_groups, original_tokens[:-1], input_embeddings[1:])): 
-                    with ctx:
-                        new_embedding = embed_layer(
-                            torch.tensor(segment_tokens, device=self.device).int())
-                    if prev_group != group or prev_group is None:
-                        previous_embeddings = new_embedding
-                    else:
-                        previous_embeddings = torch.cat([previous_embeddings, new_embedding], dim=0)
-                    # Create new tensor that preserves gradients
-                    modified_embedding = torch.cat([previous_embeddings, input_embedding], dim=0)
-                    modified_embeddings.append(modified_embedding)
-                    prev_group = group
-                # Add the first segment without previous segments
-                modified_embeddings.insert(0, input_embeddings[0])
-            else:
-                modified_embeddings = [input_embeddings[0]]
-        
-        elif self.previous_segments_mode == "latent":
-            # Extract previous segments from quantized_vectors
-            if len(quantized_vectors) > 1:
-                # Add previous segments' latent quantized vectors
-                # the first segment does not have previous segments, so we skip it
-                for i, (group, segment_embeddings, input_embedding) in enumerate(zip(segment_groups, quantized_vectors[:-1], input_embeddings[1:])): 
-                    if prev_group != group or prev_group is None:
-                        previous_embeddings = segment_embeddings
-                    else:
-                        previous_embeddings = torch.cat([previous_embeddings, segment_embeddings], dim=0)
-                    # Create new tensor that preserves gradients
-                    modified_embedding = torch.cat([previous_embeddings, input_embedding], dim=0)
-                    modified_embeddings.append(modified_embedding)
-                    prev_group = group
-                # Add the first segment without previous segments
-                modified_embeddings.insert(0, input_embeddings[0])
-            else:
-                modified_embeddings = [input_embeddings[0]]
-        
-        else:
-            raise ValueError(f"Invalid previous segments mode: {self.previous_segments_mode}")
-        
-        # Add question embedding if specified
-        if questions:
-            prev_group = None
-            for i, (group, question, input_embedding) in enumerate(zip(segment_groups, questions, modified_embeddings)):
-                if prev_group != group or prev_group is None:
-                    question_tokens = self.tokenizer.encode(question, add_special_tokens=False)
-                    with ctx:
-                        question_embeddings = embed_layer(
-                            torch.tensor(question_tokens, device=self.device).int())
-                # Create new tensor that preserves gradients
-                modified_embedding = torch.cat([question_embeddings, input_embedding], dim=0)
-                modified_embeddings[i] = modified_embedding
-                prev_group = group
-        
-        # Add prompt embeddings if specified
-        if self.prompt:
-            prompt_tokens = self.tokenizer.encode(self.prompt, add_special_tokens=False)
-            with ctx:
-                prompt_embeddings = embed_layer(
-                    torch.tensor(prompt_tokens, device=self.device).int())
-            for i, input_embedding in enumerate(modified_embeddings):
-                # Create new tensor that preserves gradients
-                modified_embedding = torch.cat([prompt_embeddings, input_embedding], dim=0)
-                modified_embeddings[i] = modified_embedding
-        
-        # create labels
-        labels = [[-100] * len(input_embedding) for input_embedding in modified_embeddings]
-
-        # Add original text embeddings
-        with ctx:
-            original_embeddings = embed_layer(
-                torch.tensor(original_tokens, device=self.device).int())
-        for i, (input_embedding, original_embedding, original_token, label) in \
-                enumerate(zip(modified_embeddings, original_embeddings, original_tokens, labels)):
-            # Create new tensor that preserves gradients
-            modified_embedding = torch.cat([original_embedding, input_embedding], dim=0)
-            modified_embeddings[i] = modified_embedding
-            # add original tokens to labels
-            label += original_token
+        # Build all embeddings in one pass
+        for i, input_embedding in enumerate(input_embeddings):
+            # Start with input embedding
+            current_embedding = input_embedding
+            
+            # Add previous segments if available
+            if len(previous_segments_embeddings) > 0:
+                assert len(previous_segments_embeddings) == len(input_embeddings)
+                if previous_segments_embeddings[i]:
+                    current_embedding = torch.cat([previous_segments_embeddings[i], current_embedding], dim=0)
+            
+            # Add question embedding if available
+            if len(question_embeddings) > 0:
+                assert len(question_embeddings) == len(input_embeddings)
+                current_embedding = torch.cat([question_embeddings[i], current_embedding], dim=0)
+            
+            # Add prompt embedding if available
+            if prompt_embedding:
+                current_embedding = torch.cat([prompt_embedding, current_embedding], dim=0)
+            
+            current_label = [-100] * len(current_embedding)
+            
+            # Add original text embedding and labels
+            if len(original_embeddings) > 0:
+                assert len(original_embeddings) == len(input_embeddings)
+                current_embedding = torch.cat([current_embedding, original_embeddings[i]], dim=0)
+                current_label += original_tokens[i]
+            
+            modified_embeddings.append(current_embedding)
+            labels.append(current_label)
         
         # reorder modified_embeddings and labels to optimize performance/memory usage
         if batch_order == "random": # possibly performance gain through randomization
@@ -325,33 +333,40 @@ class VQVAETextReconstructor(nn.Module):
         batch_input_embeddings = []
         batch_labels = []
         while len(modified_embeddings) > batch_size*i:
-            batch_input_embeddings.append(modified_embeddings[batch_size*i:batch_size*(i+1)])
-            batch_labels.append(labels[batch_size*i:batch_size*(i+1)])
+            start = batch_size*i
+            end = min(len(modified_embeddings), batch_size*(i+1))
+            batch_input_embeddings.append(modified_embeddings[start:end])
+            batch_labels.append(labels[start:end])
             i += 1
     
-        # pad sequences to the same length and create attention mask
+        # Batch pad all sequences at once
         reconstruction_loss = 0
-        for input_embeddings, labels in zip(batch_input_embeddings, batch_labels):
-            max_length = min(max([len(input_embedding) for input_embedding in input_embeddings]), self.max_length)
-            padded_input_embeddings = []
-            attention_mask = []
-            for input_embedding, label in zip(input_embeddings, labels):
-                num_pad = max_length - len(input_embedding)
-                # pad input embeddings
-                with ctx:
-                    pad_embeddings = embed_layer(
-                        torch.tensor([self.tokenizer.pad_token_id] * num_pad, device=self.device).int())
-                padded_input_embeddings.append(torch.cat([input_embedding, pad_embeddings], dim=0))
-                # create attention mask for padded input embeddings
-                attention_mask.append(torch.cat([torch.ones(len(input_embedding), device=self.device), 
-                                                torch.zeros(num_pad, device=self.device)], dim=0))
-                # update labels
-                label += [-100] * num_pad
+        with ctx:
+            pad_embedding = embed_layer(torch.tensor([self.tokenizer.pad_token_id], device=self.device).int())
             
-            # stack padded input embeddings and attention mask
-            padded_input_embeddings = torch.stack(padded_input_embeddings)
-            attention_mask = torch.stack(attention_mask)
-            labels = torch.tensor(labels, device=self.device, dtype=torch.long)
+        for input_embeddings, labels in zip(batch_input_embeddings, batch_labels):
+            batch_max_length = min(max([len(input_embedding) for input_embedding in input_embeddings]), self.max_length)
+            
+            # Pre-allocate tensors for batch processing
+            batch_size = len(input_embeddings)
+            padded_input_embeddings = pad_embedding.expand(batch_size, batch_max_length, self.hidden_size)
+            attention_mask = torch.zeros(batch_size, batch_max_length, device=self.device, dtype=torch.bool)
+            padded_labels = torch.full((batch_size, batch_max_length), -100, device=self.device, dtype=torch.long)
+            
+            # Fill tensors efficiently
+            for i, (input_embedding, label) in enumerate(zip(input_embeddings, labels)):
+                seq_len = len(input_embedding)
+                if seq_len > batch_max_length:
+                    seq_len = batch_max_length
+                
+                # Copy embeddings
+                padded_input_embeddings[i, :seq_len] = input_embedding[:seq_len]
+                
+                # Set attention mask
+                attention_mask[i, :seq_len] = 1
+                
+                # Copy labels
+                padded_labels[i, :seq_len] = torch.tensor(label[:seq_len], device=self.device, dtype=torch.long)
         
             # Run decoder model with custom embeddings and labels using inputs_embeds argument
             # This bypasses the embedding layer and directly uses our custom embeddings
@@ -360,7 +375,7 @@ class VQVAETextReconstructor(nn.Module):
                 model_outputs = self.decoder_model(
                     inputs_embeds=padded_input_embeddings,
                     attention_mask=attention_mask,
-                    labels=labels,
+                    labels=padded_labels,
                     output_attentions=False,
                     return_dict=True
                 )
