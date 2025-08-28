@@ -1,11 +1,12 @@
 import torch
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
 from typing import Union, List, Tuple
 import torch.nn as nn
 import torch.nn.functional as F
 import os
 import sys
 import random
+import copy
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from encoder import get_last_layer_representations, MultiHeadAttentionQuantizer, VectorQuantizer
 
@@ -20,10 +21,10 @@ class VQVAETextReconstructor(nn.Module):
         num_latent_tokens: int,
         num_heads: int,
         k: int,
+        pretrained_model_name: str,
         commitment_cost: float = 0.25,
         explain_token: str = "<EXPLAIN>",
         think_token: str = "<THINK>",
-        pretrained_model_name: str = None,
         prompt: str = None,
         compress_cot_only: bool = True,
         max_length: int = 512,
@@ -43,8 +44,6 @@ class VQVAETextReconstructor(nn.Module):
         self.max_length = max_length
         self.train_decoder = train_decoder
         self.previous_segments_mode = previous_segments_mode
-        if pretrained_model_name is None:
-            raise ValueError("pretrained_model_name is required")
         self.pretrained_model_name = pretrained_model_name
         
         # Auto-detect device if specified
@@ -54,7 +53,7 @@ class VQVAETextReconstructor(nn.Module):
         
         # Load encoder and decoder models, move to device
         self.encoder_model = AutoModel.from_pretrained(pretrained_model_name).to(device)
-        self.decoder_model = AutoModel.from_pretrained(pretrained_model_name).to(device)
+        self.decoder_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name).to(device)
         self.tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name)
         
         # Set pad token if not set
@@ -94,12 +93,12 @@ class VQVAETextReconstructor(nn.Module):
         # Add explain token embedding if specified
         if self.explain_token:
             self.explain_embedding = nn.Parameter(
-                torch.randn(1, 1, self.hidden_size) * 0.02).to(device)
+                torch.randn(1, self.hidden_size) * 0.02).to(device)
         
         # Add think token embedding if specified
         if self.think_token:
             self.think_embedding = nn.Parameter(
-                torch.randn(1, 1, self.hidden_size) * 0.02).to(device)        
+                torch.randn(1, self.hidden_size) * 0.02).to(device)        
             
     def encode(self, 
                inputs: Union[List[Tuple[str, str]], List[Tuple[str, str, bool]]]
@@ -116,6 +115,7 @@ class VQVAETextReconstructor(nn.Module):
         """
         # Get representations from frozen encoder
         with torch.no_grad():
+            # representations are on cpu
             representations, tokens, questions = get_last_layer_representations(
                 self.encoder_model,
                 self.tokenizer,
@@ -137,32 +137,26 @@ class VQVAETextReconstructor(nn.Module):
                 
             # process each segment separately
             for rep, tok in zip(representation, token):
-                # Add batch dimension
-                all_inputs.append(rep)
-                all_tokens.append(tok)
-                all_questions.append(question)
-                # build segment groups
-                segment_groups.append(i)
+                if len(tok) > 0: # skip empty segments
+                    all_inputs.append(rep)
+                    all_tokens.append(tok)
+                    all_questions.append(question)
+                    # build segment groups
+                    segment_groups.append(i)
                 
         # pad sequences to the same length and create attention mask
-        max_length = min(max([len(input_representation) for input_representation in all_inputs]), self.max_length)        
-        padded_inputs = []
-        attention_mask = []
-        for input_representation in all_inputs:
-            num_pad = max_length - len(input_representation)
-            # pad input embeddings
-            with torch.no_grad():
-                pad_embeddings = torch.zeros(num_pad, self.hidden_size, device=self.device)
-            padded_inputs.append(torch.cat([input_representation, pad_embeddings], dim=0))
-            # create attention mask for padded input embeddings
-            attention_mask.append(torch.cat(
-                    [torch.zeros(len(input_representation), device=self.device, dtype=torch.bool), 
-                    torch.ones(num_pad, device=self.device, dtype=torch.bool)], dim=0)
-            )
-
-        # stack padded inputs and attention mask
-        padded_inputs = torch.stack(padded_inputs)
-        attention_mask = torch.stack(attention_mask)
+        batch_size = len(all_inputs)
+        max_length = min(max([len(input_representation) for input_representation in all_inputs]), self.max_length)   
+        # input sequence tensor: [N, S, D]
+        padded_inputs = torch.zeros(batch_size, max_length, self.hidden_size, device=self.device)
+        # attention mask tensor: [N, T, S]
+        attention_mask = torch.zeros(batch_size, 1, max_length, device=self.device, dtype=torch.bool)
+        for i, input_representation in enumerate(all_inputs):
+            padded_inputs[i, :len(input_representation)] = input_representation
+            # create attention mask for padded input embeddings. True represents masked tokens.
+            attention_mask[i, :, len(input_representation):] = 1
+        # attention mask tensor: [N * H, T, S]
+        attention_mask = torch.repeat_interleave(attention_mask, self.k, dim=0)
         
         # apply multi-head attention quantizer
         quantized_vectors = self.quantizer(padded_inputs, attention_mask)
@@ -186,187 +180,221 @@ class VQVAETextReconstructor(nn.Module):
         loss computation with the labels argument.
         
         Args:
-            quantized_vectors: List of quantized vectors for each item in the batch
-            original_tokens: List of tokenized (potentially split) original CoT segments for each item
-            questions: List of questions for each CoT in the batch
-            segment_groups: List of segment groups for each CoT in the batch
+            quantized_vectors: all quantized vectors, shape: (num_segments, k, hidden_size)
+            original_tokens: List of tokenized (potentially split) original CoT segments, shape: (num_segments, num_tokens)
+            questions: List of questions for each CoT in the batch, shape: (num_segments, num_tokens)
+            segment_groups: List of segment groups for each CoT in the batch, shape: (num_segments,)
         Returns:
             Average reconstruction loss across the batch
         """
-        # Start with the quantized vectors as the initial embeddings
-        # These will serve as the "latent token" embeddings
-        input_embeddings = quantized_vectors  # Shape: (batch_size, k, hidden_size)
-        
-        # Add explain token embedding if specified
-        if self.explain_token:
-            # Expand explain embedding to match batch size
-            explain_embedding = self.explain_embedding.expand(input_embeddings.shape[0], 1, self.hidden_size)
-            input_embeddings = torch.cat([input_embeddings, explain_embedding], dim=1)
-        
-        if self.think_token:
-            think_embedding = self.think_embedding.expand(input_embeddings.shape[0], 1, self.hidden_size)
-            input_embeddings = torch.cat([think_embedding, input_embeddings], dim=1)
-        
         embed_layer = self.decoder_model.get_input_embeddings()
         ctx = torch.enable_grad() if self.train_decoder else torch.no_grad()
+        num_segments = len(quantized_vectors)
+        batch_size = max(segment_groups) + 1
         
         # Pre-compute all token embeddings to avoid repeated lookups
         all_tokens = []
-        # Collect all tokens that need embedding
+        # Collect all tokens that need embedding and record their positions
+        prompt_positions = []
+        question_positions = []
+        original_positions = []
+        quantized_positions = []
+        
+        # add pad token
+        with ctx:
+            all_tokens.append(self.tokenizer.pad_token_id)
+            pad_token_position = 0
+        
+        # add prompt tokens
         if self.prompt:
-            all_tokens.append(self.prompt)  # Prompt (only one)
+            prompt_tokens = self.tokenizer(self.prompt, add_special_tokens=False)['input_ids']
+            all_tokens += prompt_tokens
+            prompt_positions = list(range(len(all_tokens)-len(prompt_tokens), len(all_tokens)))
             
+        # add question tokens
         if questions:
-            all_tokens.extend(questions)  # Questions
+            question_tokens = self.tokenizer(questions, add_special_tokens=False)['input_ids']
+            for question in question_tokens:
+                all_tokens += question
+                question_positions.append(list(range(len(all_tokens)-len(question), len(all_tokens))))
         
-        all_tokens.extend(original_tokens)  # Original tokens
+        # add original tokens
+        for original_token in original_tokens:
+            all_tokens += original_token
+            original_positions.append(list(range(len(all_tokens)-len(original_token), len(all_tokens))))
         
-        # Batch embed all tokens at once (major speedup)
-        token_embeddings = []
+        # # Validate that original_positions and original_tokens have matching lengths
+        # for i, (pos, tokens) in enumerate(zip(original_positions, original_tokens)):
+        #     if len(pos) != len(tokens):
+        #         print(f"Error: Length mismatch in original data at index {i}: positions={len(pos)}, tokens={len(tokens)}")
+        #         # Ensure they match by truncating to the shorter length
+        #         print("positions: ", pos)
+        #         print("tokens: ", tokens)
+        #         exit(1)
+            
+        # get positions of quantized vectors
+        start_idx = len(all_tokens)
+        for _ in range(num_segments):
+            quantized_positions.append(list(range(start_idx, 
+                                        start_idx+quantized_vectors.shape[1])))
+            start_idx += quantized_vectors.shape[1]
+        
+        # batch embed all tokens at once (major speedup)
         with ctx:
             if all_tokens:
-                # Create a single tensor with all tokens for batch embedding
-                token_lengths = [len(tokens) for tokens in all_tokens]
-                max_token_len = max(token_lengths) if token_lengths else 0
-                
-                if max_token_len > 0:
-                    # Pad tokens to same length for batch processing
-                    padded_tokens = []
-                    for tokens in all_tokens:
-                        padded = tokens + [self.tokenizer.pad_token_id] * (max_token_len - len(tokens))
-                        padded_tokens.append(padded)
-                    
-                    # Batch embed all tokens
-                    all_token_tensor = torch.tensor(padded_tokens, device=self.device).int()
-                    all_embeddings = embed_layer(all_token_tensor)
-                    
-                    # Unpack embeddings back to original lengths
-                    start_idx = 0
-                    for length in token_lengths:
-                        token_embeddings.append(all_embeddings[start_idx:start_idx + length])
-                        start_idx += 1
+                all_token_tensor = torch.tensor(all_tokens, device=self.device).int()
+                token_embeddings = embed_layer(all_token_tensor)
+
+        # add quantized vectors to token embeddings
+        token_embeddings = torch.cat([token_embeddings, quantized_vectors.view(-1, self.hidden_size)], dim=0)
         
-        # upack token embeddings for prompt, questions, and original tokens
-        prompt_embedding, question_embeddings, original_embeddings, previous_segments_embeddings = None, [], [], []                
-        if self.prompt:
-            prompt_embedding = token_embeddings[0]
-            if questions:
-                question_embeddings = token_embeddings[1:len(questions)+1]
-        elif questions:
-                question_embeddings = token_embeddings[:len(questions)]
-        original_embeddings = token_embeddings[-len(original_tokens):]
+        # add explain token embedding if specified
+        if self.explain_token:
+            # add explain token embedding to token embeddings
+            token_embeddings = torch.cat([token_embeddings, self.explain_embedding], dim=0)
+            # get position of explain token
+            explain_token_position = len(token_embeddings) - 1
         
-        # build previous segments embeddings from original token embeddings or quantized vectors
-        if self.previous_segments_mode == "text" and len(original_tokens) > 1:
-            segments_embeddings = original_embeddings
-        elif self.previous_segments_mode == "latent" and len(quantized_vectors) > 1:
-            segments_embeddings = quantized_vectors
+        # add think token embedding if specified
+        if self.think_token:
+            # add think token embedding to token embeddings
+            token_embeddings = torch.cat([token_embeddings, self.think_embedding], dim=0)
+            # get position of think token
+            think_token_position = len(token_embeddings) - 1
+        
+        if self.previous_segments_mode == "text":
+            segments_positions = copy.deepcopy(original_positions)
+        elif self.previous_segments_mode == "latent":
+            segments_positions = copy.deepcopy(quantized_positions)
+        elif self.previous_segments_mode == "none":
+            segments_positions = []
         else:
-            segments_embeddings = []
+            raise ValueError(f"Invalid previous segments mode: {self.previous_segments_mode}")
         
-        # concatenate previous segments embeddings for each segment inside the same group
+        # get positions of previous segments
         prev_group = None
-        previous_segments_embeddings = torch.Tensor([], 
-                            device=self.device, dtype=input_embeddings[0].dtype)
-        for group, segment_embedding in zip(segment_groups, segments_embeddings):
+        previous_segments_positions = []
+        for group, segment_position in zip(segment_groups, segments_positions):
             if group != prev_group:
-                previous_segments_embeddings.append(None)
-                previous_segments_embedding = segment_embedding
+                previous_segments_positions.append([])
+                previous_segments_position = segment_position
                 prev_group = group
             else:
-                previous_segments_embedding = torch.cat([previous_segments_embedding, segment_embedding], dim=0)
-                previous_segments_embeddings.append(previous_segments_embedding)
+                previous_segments_position += segment_position
+                previous_segments_positions.append(previous_segments_position)
 
-        # Build modified embeddings efficiently
-        modified_embeddings = []
+        # Build input batch with positions
+        input_positions = []
         labels = []
         
-        # Build all embeddings in one pass
-        for i, input_embedding in enumerate(input_embeddings):
-            # Start with input embedding
-            current_embedding = input_embedding
+        for i in range(num_segments):
+            cur_segment_positions = []
+            cur_labels = []
+            if self.prompt:
+                cur_segment_positions += prompt_positions
+            if questions:
+                cur_segment_positions += question_positions[i]
+            if self.think_token and self.previous_segments_mode == "latent":
+                cur_segment_positions.append(think_token_position)
+            if previous_segments_positions:
+                cur_segment_positions += previous_segments_positions[i]
+            if self.explain_token and self.previous_segments_mode == "text":
+                cur_segment_positions.append(think_token_position)
+            cur_segment_positions += quantized_positions[i]
+            if self.explain_token:
+                cur_segment_positions.append(explain_token_position)
+            cur_labels += [-100] * len(cur_segment_positions)
             
-            # Add previous segments if available
-            if len(previous_segments_embeddings) > 0:
-                assert len(previous_segments_embeddings) == len(input_embeddings)
-                if previous_segments_embeddings[i]:
-                    current_embedding = torch.cat([previous_segments_embeddings[i], current_embedding], dim=0)
+            # # Ensure original_positions[i] and original_tokens[i] have matching lengths
+            # if len(original_positions[i]) != len(original_tokens[i]):
+            #     print(f"Error: Length mismatch at segment {i}: positions={len(original_positions[i])}, tokens={len(original_tokens[i])}")
+            #     print("positions: ", original_positions[i])
+            #     print("tokens: ", original_tokens[i])
+            #     exit(1)
+            # else:
+            cur_segment_positions += original_positions[i]
+            cur_labels += original_tokens[i]
+            # Ensure input_positions and labels have the same length
+            assert len(cur_segment_positions) == len(cur_labels), f"Length mismatch: positions={len(cur_segment_positions)}, labels={len(cur_labels)}"
+            input_positions.append(cur_segment_positions)
+            labels.append(cur_labels)
             
-            # Add question embedding if available
-            if len(question_embeddings) > 0:
-                assert len(question_embeddings) == len(input_embeddings)
-                current_embedding = torch.cat([question_embeddings[i], current_embedding], dim=0)
-            
-            # Add prompt embedding if available
-            if prompt_embedding:
-                current_embedding = torch.cat([prompt_embedding, current_embedding], dim=0)
-            
-            current_label = [-100] * len(current_embedding)
-            
-            # Add original text embedding and labels
-            if len(original_embeddings) > 0:
-                assert len(original_embeddings) == len(input_embeddings)
-                current_embedding = torch.cat([current_embedding, original_embeddings[i]], dim=0)
-                current_label += original_tokens[i]
-            
-            modified_embeddings.append(current_embedding)
-            labels.append(current_label)
-        
         # reorder modified_embeddings and labels to optimize performance/memory usage
         if batch_order == "random": # possibly performance gain through randomization
-            temp = list(zip(modified_embeddings, labels))
+            temp = list(zip(input_positions, labels))
             random.shuffle(temp)
-            modified_embeddings, labels = zip(*temp)
+            input_positions, labels = zip(*temp)
         elif batch_order == "length": # more efficient for long sequences
-            temp = list(zip(modified_embeddings, labels))
+            temp = list(zip(input_positions, labels))
             temp.sort(key=lambda x: len(x[0]))
-            modified_embeddings, labels = zip(*temp)
+            input_positions, labels = zip(*temp)
         elif batch_order == "none": # segments in the same CoT are grouped together
             pass
         else:
             raise ValueError(f"Invalid batch order: {batch_order}")
         
         # regroup modified_embeddings and labels to match the original batch size
-        # prevent possible memory issues    
-        batch_size = len(questions)
+        # prevent possible memory issues by batching
         i = 0
-        batch_input_embeddings = []
+        batch_input_positions = []
         batch_labels = []
-        while len(modified_embeddings) > batch_size*i:
+        while len(input_positions) > batch_size*i:
             start = batch_size*i
-            end = min(len(modified_embeddings), batch_size*(i+1))
-            batch_input_embeddings.append(modified_embeddings[start:end])
+            end = min(len(input_positions), batch_size*(i+1))
+            batch_input_positions.append(input_positions[start:end])
             batch_labels.append(labels[start:end])
             i += 1
     
         # Batch pad all sequences at once
         reconstruction_loss = 0
-        with ctx:
-            pad_embedding = embed_layer(torch.tensor([self.tokenizer.pad_token_id], device=self.device).int())
-            
-        for input_embeddings, labels in zip(batch_input_embeddings, batch_labels):
-            batch_max_length = min(max([len(input_embedding) for input_embedding in input_embeddings]), self.max_length)
+        for input_positions, labels in zip(batch_input_positions, batch_labels):
+            # # Validate that input_positions and labels have matching lengths
+            # for pos, label in zip(input_positions, labels):
+            #     if len(pos) != len(label):
+            #         print(f"Error: Length mismatch detected - positions: {len(pos)}, labels: {len(label)}")
+            #         print(f"Position sample: {pos[:5]}...")
+            #         print(f"Label sample: {label[:5]}...")
+            #         exit(1)
+            batch_max_length = min(max([len(input_position) for input_position in input_positions]), self.max_length)
             
             # Pre-allocate tensors for batch processing
-            batch_size = len(input_embeddings)
-            padded_input_embeddings = pad_embedding.expand(batch_size, batch_max_length, self.hidden_size)
-            attention_mask = torch.zeros(batch_size, batch_max_length, device=self.device, dtype=torch.bool)
-            padded_labels = torch.full((batch_size, batch_max_length), -100, device=self.device, dtype=torch.long)
-            
-            # Fill tensors efficiently
-            for i, (input_embedding, label) in enumerate(zip(input_embeddings, labels)):
-                seq_len = len(input_embedding)
+            batch_size = len(input_positions)
+            # zero is the default value for padding positions
+            padded_input_positions = [[0] * batch_max_length for _ in range(batch_size)]
+            attention_mask = [[False] * batch_max_length for _ in range(batch_size)]
+            padded_labels = [[-100] * batch_max_length for _ in range(batch_size)]
+
+            for i, (input_position, label) in enumerate(zip(input_positions, labels)):
+                assert len(input_position) == len(label), f"Length mismatch: positions={len(input_position)}, labels={len(label)}"
+                seq_len = len(input_position)
+                # Ensure sequences are truncated to the same length
                 if seq_len > batch_max_length:
                     seq_len = batch_max_length
                 
                 # Copy embeddings
-                padded_input_embeddings[i, :seq_len] = input_embedding[:seq_len]
+                padded_input_positions[i][:seq_len] = input_position[:seq_len]
                 
                 # Set attention mask
-                attention_mask[i, :seq_len] = 1
+                for j in range(seq_len):
+                    attention_mask[i][j] = True
                 
                 # Copy labels
-                padded_labels[i, :seq_len] = torch.tensor(label[:seq_len], device=self.device, dtype=torch.long)
+                padded_labels[i][:seq_len] = label[:seq_len]
+            
+            # Convert to tensors
+            padded_input_positions = torch.tensor(padded_input_positions, device=self.device, dtype=torch.int)
+            attention_mask = torch.tensor(attention_mask, device=self.device, dtype=torch.bool)
+            padded_labels = torch.tensor(padded_labels, device=self.device, dtype=torch.long)
+        
+            padded_input_positions_flat = padded_input_positions.flatten()
+            one_hot = torch.zeros(len(padded_input_positions_flat), token_embeddings.shape[0], device=self.device)
+            # Ensure the indices tensor has the right shape for scatter_
+            indices = padded_input_positions_flat.unsqueeze(1)  # Add dimension for scatter_
+            one_hot.scatter_(1, indices, 1)
+            
+            # Get input embeddings
+            padded_input_embeddings = torch.matmul(one_hot, token_embeddings)
+            padded_input_embeddings = padded_input_embeddings.view(batch_size, batch_max_length, self.hidden_size)
         
             # Run decoder model with custom embeddings and labels using inputs_embeds argument
             # This bypasses the embedding layer and directly uses our custom embeddings
@@ -381,9 +409,14 @@ class VQVAETextReconstructor(nn.Module):
                 )
                 
             # compute reconstruction loss
-            reconstruction_loss += model_outputs.loss
+            if hasattr(model_outputs, 'loss') and model_outputs.loss is not None:
+                reconstruction_loss += model_outputs.loss
+            else:
+                print(f"Error: Model output has no loss attribute. Output type: {type(model_outputs)}")
+                print(f"Available attributes: {dir(model_outputs)}")
+                exit(1)
         
-        reconstruction_loss /= len(batch_input_embeddings)
+        reconstruction_loss /= len(batch_input_positions)
         
         # Return the reconstruction loss average across segments
         return reconstruction_loss
@@ -409,7 +442,7 @@ class VQVAETextReconstructor(nn.Module):
         # Combine VQ loss and reconstruction loss
         total_loss = vq_loss + reconstruction_loss
         
-        return total_loss, reconstruction_loss, vq_loss, encoding_indices, quantized, perplexity 
+        return quantized, vq_loss, perplexity, reconstruction_loss, total_loss 
     
         
     def save_checkpoint(self, checkpoint_path: str):
@@ -458,13 +491,12 @@ class VQVAETextReconstructor(nn.Module):
         
         print(f"Checkpoint saved to: {checkpoint_path}")
     
-    def load_from_checkpoint(self, checkpoint_path: str, pretrained_model_name: str = None):
+    def load_from_checkpoint(self, checkpoint_path: str):
         """
         Load VQVAETextReconstructor from a saved checkpoint.
         
         Args:
             checkpoint_path: Path to the saved checkpoint
-            pretrained_model_name: Optional override for the pretrained model name
             
         Returns:
             Loaded VQVAETextReconstructor instance
@@ -472,11 +504,11 @@ class VQVAETextReconstructor(nn.Module):
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        # Load checkpoint with weights_only=False to handle tokenizer and other objects
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         
         # Extract configuration
         config = checkpoint['config']
-        pretrained_model_name = pretrained_model_name or config['pretrained_model_name']
         
         # Get all config parameters
         model_kwargs = {
@@ -486,7 +518,7 @@ class VQVAETextReconstructor(nn.Module):
             'commitment_cost': config['commitment_cost'],
             'explain_token': config['explain_token'],
             'think_token': config['think_token'],
-            'pretrained_model_name': pretrained_model_name,
+            'pretrained_model_name': config['pretrained_model_name'],
             'prompt': config.get('prompt', None),
             'compress_cot_only': config.get('compress_cot_only', True),
             'max_length': config.get('max_length', 512),
@@ -510,14 +542,14 @@ class VQVAETextReconstructor(nn.Module):
         
         # Load explain embedding if available
         if 'explain_embedding' in trained_components:
-            model.explain_embedding = nn.Parameter(trained_components['explain_embedding'])
+            model.explain_embedding = nn.Parameter(trained_components['explain_embedding'].to(model.device))
         
         # Load thinking embedding if available
         if 'think_embedding' in trained_components:
-            model.think_embedding = nn.Parameter(trained_components['think_embedding'])
+            model.think_embedding = nn.Parameter(trained_components['think_embedding'].to(model.device))
         
         print(f"Model loaded from checkpoint: {checkpoint_path}")
-        print(f"Pretrained model: {pretrained_model_name}")
+        print(f"Pretrained model: {config['pretrained_model_name']}")
         print(f"Configuration: {config}")
         
         return model
@@ -949,84 +981,91 @@ if __name__ == "__main__":
     
     # Example 13: VQ-VAE usage
     print("\n=== VQ-VAE Demo ===")
-    try:
-        # Create VQ-VAE model
-        vq_vae = VQVAETextReconstructor(
-            pretrained_model_name="../models/OLMo-2-0425-1B-Base",
-            num_latent_tokens=64,  # 64 latent tokens
-            k=8,                   # 8 quantized vectors
-            num_heads=8,           # 8 attention heads
-            commitment_cost=0.25
-        )
-        
-        print(f"Created VQ-VAE model with:")
-        print(f"  - {vq_vae.num_latent_tokens} latent tokens")
-        print(f"  - {vq_vae.k} quantized vectors")
-        print(f"  - {vq_vae.hidden_size} hidden size")
+    # Create VQ-VAE model
+    vq_vae = VQVAETextReconstructor(
+        pretrained_model_name="../models/OLMo-2-0425-1B-Base",
+        num_latent_tokens=64,  # 64 latent tokens
+        k=8,                   # 8 quantized vectors
+        num_heads=8,           # 8 attention heads
+        commitment_cost=0.25
+    )
+    
+    print(f"Created VQ-VAE model with:")
+    print(f"  - {vq_vae.num_latent_tokens} latent tokens")
+    print(f"  - {vq_vae.k} quantized vectors")
+    print(f"  - {vq_vae.hidden_size} hidden size")
 
-        # Test encoding and decoding
-        test_text = [("Test question", "This is a test sentence for VQ-VAE.")]
-        print(f"\nTesting with text: {test_text}")
-        
-        # Encode
-        quantized, vq_loss, perplexity, questions, tokens = vq_vae.encode(test_text)
-        print(f"Encoded shape: {quantized[0].shape if quantized else 'empty'}")
-        print(f"VQ loss: {vq_loss[0].item():.4f}")
-        print(f"Perplexity: {perplexity[0].item():.2f}")
-        
-        # Decode - note: decode now returns only the loss for batched input
-        recon_loss = vq_vae.decode(quantized, tokens, questions)
-        print(f"Reconstruction loss: {recon_loss.item():.4f}")
-        
-        # Full forward pass
-        quantized, vq_loss, perplexity, recon_loss, total_loss = vq_vae(test_text)
-        print(f"Full forward pass completed successfully!")
-        print(f"Average reconstruction loss: {recon_loss.item():.4f}")
-        print(f"Total VQ-VAE loss: {total_loss.item():.4f}")
-        
-        # Demonstrate checkpoint functionality
-        print(f"\n=== Checkpoint Demo ===")
-        
-        # Save checkpoint
-        checkpoint_path = "vq_vae_checkpoint.pt"
-        vq_vae.save_checkpoint(checkpoint_path)
-        print(f"Saved checkpoint to: {checkpoint_path}")
-        
-        # Get checkpoint info
-        checkpoint_info = vq_vae.get_checkpoint_info()
-        print(f"Checkpoint info: {checkpoint_info}")
-        
-        # Load from checkpoint
-        print(f"\nLoading from checkpoint...")
-        loaded_vq_vae = VQVAETextReconstructor.load_from_checkpoint(checkpoint_path)
-        
-        # Test loaded model
-        test_text_loaded = [("Test question loaded", "Testing the loaded model with this sentence.")]
-        quantized_loaded, vq_loss_loaded, perplexity_loaded, recon_loss_loaded, total_loss_loaded = loaded_vq_vae(test_text_loaded)
-        print(f"Loaded model test successful!")
-        print(f"  - VQ loss: {vq_loss_loaded.item():.4f}")
-        print(f"  - Perplexity: {perplexity_loaded.item():.2f}")
-        print(f"  - Reconstruction loss: {recon_loss_loaded.item():.4f}")
-        print(f"  - Total loss: {total_loss_loaded.item():.4f}")
-        
-        # Clean up checkpoint files
-        if os.path.exists(checkpoint_path):
-            os.remove(checkpoint_path)
-        print(f"\nCleaned up checkpoint files.")
-        
-        # Demonstrate additional checkpoint features
-        print(f"\n=== Additional Checkpoint Features ===")
-        
-        # Show model size information
-        size_info = vq_vae.get_model_size_info()
-        print(f"Model size info: {size_info}")
-        
-        # Note: Some advanced checkpoint features are not implemented in this version
-        print(f"Advanced checkpoint features (latent embeddings only, inference export) are not implemented.")
-        
-    except Exception as e:
-        print(f"VQ-VAE demo failed: {e}")
-        print("This might be due to model compatibility or missing dependencies.")
+    # Test encoding and decoding
+    test_text = [("Test question", "This is a test sentence for VQ-VAE."), 
+                    ("Test question 2", "This is should be splitted into two segments: This is the first segment. This is the second segment.")]
+    print(f"\nTesting with text: {test_text}")
+    
+    # Encode
+    quantized, vq_loss, perplexity, encoding_indices, questions, tokens, segment_groups = vq_vae.encode(test_text)
+    print(f"Encoded shape: {quantized.shape}")
+    print(f"VQ loss: {vq_loss.item():.4f}")
+    print(f"Perplexity: {perplexity.item():.2f}")
+    print(f"Encoding indices: {encoding_indices}")
+    print(f"Questions: {questions}")
+    print(f"Tokens: {tokens}")
+    print(f"Segment groups: {segment_groups}")
+    
+    # Decode - note: decode now returns only the loss for batched input
+    recon_loss = vq_vae.decode(quantized, tokens, questions, segment_groups)
+    print(f"Reconstruction loss: {recon_loss.item():.4f}")
+    
+    # Full forward pass
+    quantized, vq_loss, perplexity, recon_loss, total_loss = vq_vae(test_text)
+    print(f"Full forward pass completed successfully!")
+    print(f"Average reconstruction loss: {recon_loss.item():.4f}")
+    print(f"Total VQ-VAE loss: {total_loss.item():.4f}")
+    
+    # Demonstrate checkpoint functionality
+    print(f"\n=== Checkpoint Demo ===")
+    
+    # Save checkpoint
+    checkpoint_path = "vq_vae_checkpoint.pt"
+    vq_vae.save_checkpoint(checkpoint_path)
+    print(f"Saved checkpoint to: {checkpoint_path}")
+    
+    # Get checkpoint info
+    checkpoint_info = vq_vae.get_checkpoint_info()
+    print(f"Checkpoint info: {checkpoint_info}")
+    
+    # Load from checkpoint
+    print(f"\nLoading from checkpoint...")
+    # Create a temporary instance to call the load method
+    temp_vq_vae = VQVAETextReconstructor(
+        pretrained_model_name="../models/OLMo-2-0425-1B-Base",
+        num_latent_tokens=64,
+        k=8,
+        num_heads=8,
+        commitment_cost=0.25
+    )
+    loaded_vq_vae = temp_vq_vae.load_from_checkpoint(checkpoint_path)
+    
+    # Test loaded model
+    quantized_loaded, vq_loss_loaded, perplexity_loaded, recon_loss_loaded, total_loss_loaded = loaded_vq_vae(test_text)
+    print(f"Loaded model test successful!")
+    print(f"  - VQ loss: {vq_loss_loaded.item():.4f}")
+    print(f"  - Perplexity: {perplexity_loaded.item():.2f}")
+    print(f"  - Reconstruction loss: {recon_loss_loaded.item():.4f}")
+    print(f"  - Total loss: {total_loss_loaded.item():.4f}")
+    
+    # Clean up checkpoint files
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+    print(f"\nCleaned up checkpoint files.")
+    
+    # Demonstrate additional checkpoint features
+    print(f"\n=== Additional Checkpoint Features ===")
+    
+    # Show model size information
+    size_info = vq_vae.get_model_size_info()
+    print(f"Model size info: {size_info}")
+    
+    # Note: Some advanced checkpoint features are not implemented in this version
+    print(f"Advanced checkpoint features (latent embeddings only, inference export) are not implemented.")
     
     # Uncomment the line below to run the comprehensive checkpoint workflow demo
     # demonstrate_checkpoint_workflow()

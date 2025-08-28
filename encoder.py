@@ -129,7 +129,7 @@ class VectorQuantizer(nn.Module):
         avg_probs = torch.mean(encodings, dim=0)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
         
-        return quantized, loss, perplexity, encoding_indices
+        return quantized, loss, perplexity, encoding_indices.view(batch_size, k)
 
 
 def clean_tokens_for_display(tokens: List[str]) -> List[str]:
