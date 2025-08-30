@@ -1,0 +1,17 @@
+python train_vq_vae.py \
+    --pretrained_model_name ../models/Qwen3-1.7B \
+    --data_path ./test_training_outputs/sample_data.json \
+    --num_latent_tokens 16 \
+    --num_heads 2 \
+    --k 2 \
+    --batch_size 2 \
+    --num_epochs 1 \
+    --learning_rate 1e-3 \
+    --output_dir ./test_simple_outputs \
+    --save_steps 100 \
+    --log_steps 100 \
+    --seed 42 \
+    --use_wandb \
+    --wandb_project vq-vae-text-reconstructor \
+    --wandb_run_name test_simple_outputs \
+    --wandb_offline \

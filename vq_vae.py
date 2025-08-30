@@ -29,7 +29,7 @@ class VQVAETextReconstructor(nn.Module):
         compress_cot_only: bool = True,
         max_length: int = 512,
         train_decoder: bool = False,
-        previous_segments_mode: str = "text", # "text" or "latent"
+        previous_segments_mode: str = "text", # "text" or "latent" or "none"
         device: str = "auto"
     ):
         super().__init__()
@@ -98,7 +98,74 @@ class VQVAETextReconstructor(nn.Module):
         # Add think token embedding if specified
         if self.think_token:
             self.think_embedding = nn.Parameter(
-                torch.randn(1, self.hidden_size) * 0.02).to(device)        
+                torch.randn(1, self.hidden_size) * 0.02).to(device)
+            
+    @classmethod
+    def load_from_checkpoint(cls, checkpoint_path: str, device: str = "auto"):
+        """
+        Load VQVAETextReconstructor from a saved checkpoint.
+        
+        Args:
+            checkpoint_path: Path to the saved checkpoint
+            
+        Returns:
+            Loaded VQVAETextReconstructor instance
+        """
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        
+        device = torch.device(device) if device != "auto" \
+            else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Load checkpoint with weights_only=False to handle tokenizer and other objects
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        
+        # Extract configuration
+        config = checkpoint['config']
+        
+        # Get all config parameters
+        model_kwargs = {
+            'num_latent_tokens': config['num_latent_tokens'],
+            'num_heads': config['num_heads'],
+            'k': config['k'],
+            'commitment_cost': config['commitment_cost'],
+            'explain_token': config['explain_token'],
+            'think_token': config['think_token'],
+            'pretrained_model_name': config['pretrained_model_name'],
+            'prompt': config.get('prompt', None),
+            'compress_cot_only': config.get('compress_cot_only', True),
+            'max_length': config.get('max_length', 512),
+            'train_decoder': config.get('train_decoder', False),
+            'previous_segments_mode': config.get('previous_segments_mode', 'text')
+        }
+        
+        # Create model instance
+        model = cls(**model_kwargs, device=device)
+        
+        # Load trained components
+        trained_components = checkpoint['trained_components']
+        
+        # Load quantizer state
+        if 'quantizer_state_dict' in trained_components:
+            model.quantizer.load_state_dict(trained_components['quantizer_state_dict'])
+        
+        # Load VQ state
+        if 'vq_state_dict' in trained_components:
+            model.vq.load_state_dict(trained_components['vq_state_dict'])
+        
+        # Load explain embedding if available
+        if 'explain_embedding' in trained_components:
+            model.explain_embedding = nn.Parameter(trained_components['explain_embedding'].to(model.device))
+        
+        # Load thinking embedding if available
+        if 'think_embedding' in trained_components:
+            model.think_embedding = nn.Parameter(trained_components['think_embedding'].to(model.device))
+        
+        print(f"Model loaded from checkpoint: {checkpoint_path}")
+        print(f"Pretrained model: {config['pretrained_model_name']}")
+        print(f"Configuration: {config}")
+        
+        return model      
             
     def encode(self, 
                inputs: Union[List[Tuple[str, str]], List[Tuple[str, str, bool]]]
@@ -430,7 +497,7 @@ class VQVAETextReconstructor(nn.Module):
             inputs: Input list of (question, cot) pairs or list of (question, cot, return_cot_only) tuples. Always batched.
             
         Returns:
-            Tuple of (quantized_vectors, vq_loss, perplexity, reconstruction_loss, total_loss)
+            Tuple of (vq_loss, perplexity, reconstruction_loss, total_loss)
         """
         # Encode
         quantized, vq_loss, perplexity, encoding_indices, questions, tokens, segment_groups = self.encode(inputs)
@@ -442,7 +509,7 @@ class VQVAETextReconstructor(nn.Module):
         # Combine VQ loss and reconstruction loss
         total_loss = vq_loss + reconstruction_loss
         
-        return quantized, vq_loss, perplexity, reconstruction_loss, total_loss 
+        return vq_loss, perplexity, reconstruction_loss, total_loss 
     
         
     def save_checkpoint(self, checkpoint_path: str):
@@ -490,69 +557,6 @@ class VQVAETextReconstructor(nn.Module):
         torch.save(checkpoint_data, checkpoint_path)
         
         print(f"Checkpoint saved to: {checkpoint_path}")
-    
-    def load_from_checkpoint(self, checkpoint_path: str):
-        """
-        Load VQVAETextReconstructor from a saved checkpoint.
-        
-        Args:
-            checkpoint_path: Path to the saved checkpoint
-            
-        Returns:
-            Loaded VQVAETextReconstructor instance
-        """
-        if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-        
-        # Load checkpoint with weights_only=False to handle tokenizer and other objects
-        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-        
-        # Extract configuration
-        config = checkpoint['config']
-        
-        # Get all config parameters
-        model_kwargs = {
-            'num_latent_tokens': config['num_latent_tokens'],
-            'num_heads': config['num_heads'],
-            'k': config['k'],
-            'commitment_cost': config['commitment_cost'],
-            'explain_token': config['explain_token'],
-            'think_token': config['think_token'],
-            'pretrained_model_name': config['pretrained_model_name'],
-            'prompt': config.get('prompt', None),
-            'compress_cot_only': config.get('compress_cot_only', True),
-            'max_length': config.get('max_length', 512),
-            'train_decoder': config.get('train_decoder', False),
-            'previous_segments_mode': config.get('previous_segments_mode', 'text')
-        }
-        
-        # Create model instance
-        model = VQVAETextReconstructor(**model_kwargs)
-        
-        # Load trained components
-        trained_components = checkpoint['trained_components']
-        
-        # Load quantizer state
-        if 'quantizer_state_dict' in trained_components:
-            model.quantizer.load_state_dict(trained_components['quantizer_state_dict'])
-        
-        # Load VQ state
-        if 'vq_state_dict' in trained_components:
-            model.vq.load_state_dict(trained_components['vq_state_dict'])
-        
-        # Load explain embedding if available
-        if 'explain_embedding' in trained_components:
-            model.explain_embedding = nn.Parameter(trained_components['explain_embedding'].to(model.device))
-        
-        # Load thinking embedding if available
-        if 'think_embedding' in trained_components:
-            model.think_embedding = nn.Parameter(trained_components['think_embedding'].to(model.device))
-        
-        print(f"Model loaded from checkpoint: {checkpoint_path}")
-        print(f"Pretrained model: {config['pretrained_model_name']}")
-        print(f"Configuration: {config}")
-        
-        return model
     
     def get_checkpoint_info(self) -> dict:
         """Get information about the current model configuration and components."""
@@ -1015,7 +1019,7 @@ if __name__ == "__main__":
     print(f"Reconstruction loss: {recon_loss.item():.4f}")
     
     # Full forward pass
-    quantized, vq_loss, perplexity, recon_loss, total_loss = vq_vae(test_text)
+    vq_loss, perplexity, recon_loss, total_loss = vq_vae(test_text)
     print(f"Full forward pass completed successfully!")
     print(f"Average reconstruction loss: {recon_loss.item():.4f}")
     print(f"Total VQ-VAE loss: {total_loss.item():.4f}")
@@ -1027,10 +1031,6 @@ if __name__ == "__main__":
     checkpoint_path = "vq_vae_checkpoint.pt"
     vq_vae.save_checkpoint(checkpoint_path)
     print(f"Saved checkpoint to: {checkpoint_path}")
-    
-    # Get checkpoint info
-    checkpoint_info = vq_vae.get_checkpoint_info()
-    print(f"Checkpoint info: {checkpoint_info}")
     
     # Load from checkpoint
     print(f"\nLoading from checkpoint...")
@@ -1066,6 +1066,3 @@ if __name__ == "__main__":
     
     # Note: Some advanced checkpoint features are not implemented in this version
     print(f"Advanced checkpoint features (latent embeddings only, inference export) are not implemented.")
-    
-    # Uncomment the line below to run the comprehensive checkpoint workflow demo
-    # demonstrate_checkpoint_workflow()
