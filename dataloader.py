@@ -11,7 +11,6 @@ class TextDataset(Dataset):
     
     def __init__(self, data: List[Tuple[str, str]], max_length: int = 512):
         self.data = data
-        shuffle(self.data)
         self.max_length = max_length
         
     def __len__(self):

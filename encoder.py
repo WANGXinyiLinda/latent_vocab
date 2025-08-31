@@ -1,6 +1,6 @@
 import torch
 from transformers import AutoTokenizer, AutoModel
-from typing import Union, List, Tuple
+from typing import Union, List, Tuple, Sequence
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -156,11 +156,11 @@ def clean_tokens_for_display(tokens: List[str]) -> List[str]:
 def get_last_layer_representations(
     model: AutoModel,
     tokenizer: AutoTokenizer,
-    text: Union[str, List[Tuple[str, str]], List[Tuple[str, str, bool]]],
+    inputs: Union[str, Sequence],
     device: str = "cpu",
     max_length: int = 512,
     return_token_text: bool = False,
-    split_delimiters: List[str] = ["\n", ".", "!", "?"],
+    split_delimiters: Sequence[str] = ["\n", ".", "!", "?"],
     return_cot_only: bool = False
 ) -> Union[Tuple[List[List[torch.Tensor]], List[List[List[str]]], List[str]], 
            Tuple[List[List[torch.Tensor]], List[List[List[str]]]],
@@ -177,14 +177,13 @@ def get_last_layer_representations(
     Args:
         model (AutoModel): Hugging Face pretrained model
         tokenizer (AutoTokenizer): Hugging Face pretrained tokenizer
-        text (Union[str, List[Tuple[str, str]], List[Tuple[str, str, bool]]]): 
+        inputs (Union[str, Sequence]): 
             - Single string input
-            - List of (question, cot) pairs
-            - List of (question, cot, return_cot_only) tuples where return_cot_only overrides the global parameter
+            - Question sequence, CoT sequence, and optional return_cot_only sequence
         device (str): Device to run the model on ("cpu", "cuda", or specific device)
         max_length (int): Maximum sequence length for tokenization
         return_token_text (bool): Whether to return token text (True) or token indices (False)
-        split_delimiters (List[str]): List of text delimiters to split on (e.g., ["\n", ".", "Answer:"])
+        split_delimiters (Sequence[str]): Sequence of text delimiters to split on (e.g., ["\n", ".", "Answer:"])
         return_cot_only (bool): For question+cot pairs, if True, only return representations and tokens from the CoT part
         
     Returns:
@@ -202,60 +201,32 @@ def get_last_layer_representations(
     """
     
     # Handle batch processing
-    is_batch = isinstance(text, list)
-    if is_batch:
-        texts = text
-        if not texts:
-            return ([], [])
-        
-        # Check if this is a list of question+cot pairs
-        is_qc_pairs = all(isinstance(item, tuple) and len(item) >= 2 for item in texts)
-        
-        if is_qc_pairs:
-            # Extract questions and cots, and check for return_cot_only overrides
-            questions = []
-            cots = []
-            cot_only_flags = []
-            
-            for item in texts:
-                if len(item) == 2:
-                    questions.append(item[0])
-                    cots.append(item[1])
-                    cot_only_flags.append(return_cot_only)  # Use global parameter
-                elif len(item) == 3:
-                    questions.append(item[0])
-                    cots.append(item[1])
-                    cot_only_flags.append(item[2])  # Use item-specific override
-                else:
-                    raise ValueError(f"Invalid tuple length {len(item)}. Expected 2 or 3 elements.")
-            
-            # Concatenate question + cot for encoding
-            concatenated_texts = [f"{q} {cot}" for q, cot in zip(questions, cots)]
-            original_texts = concatenated_texts  # Keep for reference
-        else:
-            # Regular text list
-            concatenated_texts = texts
-            original_texts = texts
-            cot_only_flags = [False] * len(texts)
-            questions = [None] * len(texts)
-    else:
-        # Single text input - check if it's a question+cot pair
-        if isinstance(text, tuple) and len(text) >= 2:
-            # Single question+cot pair
+    if isinstance(inputs, str):
+        # Single regular text
+        is_qc_pairs = False
+        questions = [None]
+        cots = [None]
+        cot_only_flags = [False]
+        concatenated_texts = [inputs]
+    elif isinstance(inputs, Sequence):
+        if len(inputs) == 2:
+            # Question+cot pair tuple
             is_qc_pairs = True
-            questions = [text[0]]
-            cots = [text[1]]
-            cot_only_flags = [return_cot_only]
-            concatenated_texts = [f"{text[0]} {text[1]}"]
-            original_texts = concatenated_texts
+            questions = inputs[0]
+            cots = inputs[1]
+            cot_only_flags = [return_cot_only] * len(inputs[0])
+            concatenated_texts = [f"{q} {c}" for q, c in zip(questions, cots)]
+        elif len(inputs) == 3:
+            # Question+cot pair tuple with return_cot_only flag
+            is_qc_pairs = True
+            questions = inputs[0]
+            cots = inputs[1]
+            cot_only_flags = inputs[2]
+            concatenated_texts = [f"{q} {c}" for q, c in zip(questions, cots)]
         else:
-            # Single regular text
-            is_qc_pairs = False
-            questions = [None]
-            cots = [None]
-            cot_only_flags = [False]
-            concatenated_texts = [text]
-            original_texts = [text]
+            raise ValueError(f"Invalid tuple length {len(inputs)}. Expected 2 or 3 elements.")
+    else:
+        raise ValueError(f"Invalid text type: {type(inputs)}")
     
     # Tokenize the input texts
     inputs = tokenizer(
@@ -360,7 +331,7 @@ def get_last_layer_representations(
                 else:
                     start = 0
                 while True:
-                    pos = original_texts[batch_idx].find(delimiter, start)
+                    pos = concatenated_texts[batch_idx].find(delimiter, start)
                     if pos == -1:
                         break
                     split_positions.append(pos + len(delimiter))  # Split after the delimiter

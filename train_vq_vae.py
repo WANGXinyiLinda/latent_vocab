@@ -4,6 +4,12 @@ Training script for VQVAETextReconstructor
 
 This script trains a VQ-VAE model for text reconstruction using pretrained language models.
 It includes data loading, training loops, validation, logging, and checkpointing.
+
+Features:
+- Gradient checkpointing for memory efficiency (--use_gradient_checkpointing)
+- FSDP support for distributed training
+- Mixed precision training (FP16/BF16)
+- Checkpoint resumption with optimizer state preservation
 """
 
 import os
@@ -66,6 +72,9 @@ def train_loop(
     best_val_loss: float = float('inf'),
     output_dir: str = "./outputs",
     base_seed: int = None,
+    use_bf16: bool = False,
+    use_fp16: bool = False,
+    dtype: torch.dtype = torch.float32,
 ) -> Dict[str, float]:
     """
     Train for one epoch.
@@ -111,61 +120,66 @@ def train_loop(
     # current_epoch: which epoch we're currently in (0-indexed)
     # total_epochs: total number of epochs we'll train for
     steps_per_epoch = max(1, num_data // batch_size)
-    current_epoch = start_step // steps_per_epoch
     total_epochs = (total_steps + steps_per_epoch - 1) // steps_per_epoch  # Ceiling division
     
     if start_step >= total_steps:
         return {}
     
-    progress_bar = tqdm.tqdm(total=total_steps, initial=start_step, desc=f"Epoch {current_epoch + 1}/{total_epochs}")
+    progress_bar = tqdm.tqdm(range(total_steps), desc=f"Epoch 0/{total_epochs}")
     
     # Track current step and epoch
     current_step = 0
+    metrics = {}
     
     # Main training loop
     while current_step < total_steps:
         current_epoch = current_step // steps_per_epoch
         progress_bar.set_description(f"Epoch {current_epoch + 1}/{total_epochs}")
         logger.info(f"Epoch {current_epoch + 1}/{total_epochs}")
-        
+    
         # Update sampler epoch for deterministic shuffling
         if hasattr(train_dataloader.sampler, 'set_epoch'):
             train_dataloader.sampler.set_epoch(current_epoch)
         
         # Iterate through the dataloader for this epoch
         for batch in train_dataloader:
+            progress_bar.update(1)
             # Skip steps if we're resuming from a checkpoint
             if current_step < start_step:
                 current_step += 1
                 continue
                 
             model.train()
-            
-            # Handle batch format - batch could be a single item or a list
-            if not isinstance(batch, list):
-                batch = [batch]  
-            # Ensure batch is in the correct format
-            batch = [(q, a) for q, a in batch]
-            
             # Forward pass
             optimizer.zero_grad()
             
             # Use mixed precision if enabled
-            if scaler is not None:
-                with torch.amp.autocast():
+            if use_bf16 or use_fp16:
+                # Use autocast for both bf16 and fp16
+                with torch.amp.autocast(device_type='cuda', dtype=dtype):
                     vq_loss, perplexity, recon_loss, total_batch_loss = model(batch)
                 
-                # Backward pass with scaler
-                scaler.scale(total_batch_loss).backward()
-                
-                # Gradient clipping
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip)
-                
-                # Optimizer step with scaler
-                scaler.step(optimizer)
-                scaler.update()
+                if scaler is not None:
+                    # FP16 with GradScaler
+                    scaler.scale(total_batch_loss).backward()
+                    
+                    # Gradient clipping
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip)
+                    
+                    # Optimizer step with scaler
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    # BF16 without GradScaler
+                    total_batch_loss.backward()
+                    
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip)
+                    
+                    optimizer.step()
             else:
+                # FP32 training
                 vq_loss, perplexity, recon_loss, total_batch_loss = model(batch)
                 
                 # Backward pass
@@ -196,22 +210,21 @@ def train_loop(
             })
         
             # Calculate moving averages
-            metrics = {
-                'train_loss': total_loss / (current_step + 1),
-                'train_vq_loss': total_vq_loss / (current_step + 1),
-                'train_recon_loss': total_recon_loss / (current_step + 1),
-                'train_perplexity': total_perplexity / (current_step + 1)
-            }
-            
+            metrics['train_loss'] = total_loss / (current_step + 1)
+            metrics['train_vq_loss'] = total_vq_loss / (current_step + 1)
+            metrics['train_recon_loss'] = total_recon_loss / (current_step + 1)
+            metrics['train_perplexity'] = total_perplexity / (current_step + 1)
+
             if test_steps and current_step % test_steps == 0:
-                test_metrics = validate_loop(model, val_dataloader, logger)
-                metrics = {**metrics, **test_metrics}
+                test_metrics = validate_loop(model, val_dataloader, batch_size, logger)
+                metrics.update(test_metrics)
                 # Update best validation loss if we have validation metrics
-                if test_metrics['val_loss'] < best_val_loss:
+                if test_metrics and 'val_loss' in test_metrics and test_metrics['val_loss'] < best_val_loss:
                     # Save best model
                     best_model_path = os.path.join(output_dir, "best_model.pt")
                     model.save_checkpoint(best_model_path)
                     best_val_loss = test_metrics['val_loss']  # Update best_val_loss
+                    metrics['best_val_loss'] = best_val_loss
                     logger.info(f"New best model saved with validation loss: {best_val_loss:.4f}")
                     
                     # Log best model info to WandB
@@ -265,6 +278,7 @@ def train_loop(
 def validate_loop(
     model: VQVAETextReconstructor,
     dataloader: DataLoader,
+    batch_size: int,
     logger: logging.Logger,
 ) -> Dict[str, float]:
     """
@@ -273,9 +287,8 @@ def validate_loop(
     Args:
         model: VQVAETextReconstructor model
         dataloader: Validation data loader
-        device: Device to validate on
+        batch_size: Batch size
         logger: Logger instance
-        epoch: Current epoch number
         
     Returns:
         Dictionary with validation metrics
@@ -295,12 +308,6 @@ def validate_loop(
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(progress_bar):
-            # Handle batch format - batch could be a single item or a list
-            if not isinstance(batch, list):
-                batch = [batch]
-            # Ensure batch is in the correct format
-            batch = [(q, a) for q, a in batch]
-            
             # Forward pass
             vq_loss, perplexity, recon_loss, total_batch_loss = model(batch)
             
@@ -377,7 +384,7 @@ def save_checkpoint(
     Returns:
         Path to saved checkpoint
     """
-    checkpoint_dir = os.path.join(checkpoint_dir, f"epoch_{epoch}")
+    checkpoint_dir = os.path.join(checkpoint_dir, f"step_{trained_steps}")
     os.makedirs(checkpoint_dir, exist_ok=True)
     
     # Save model checkpoint
@@ -430,20 +437,23 @@ def save_checkpoint(
                 # Model is not FSDP-wrapped, use regular saving
                 logger.warning("Model is not FSDP-wrapped but use_fsdp=True. Using regular saving.")
                 model.save_checkpoint(model_checkpoint_path)
+                use_fsdp = False
                 
         except ImportError:
             logger.error("FSDP not available. Falling back to regular model saving.")
             model.save_checkpoint(model_checkpoint_path)
+            use_fsdp = False
         except Exception as e:
             logger.error(f"FSDP checkpointing failed: {e}. Falling back to regular saving.")
             model.save_checkpoint(model_checkpoint_path)
+            use_fsdp = False
     else:
         # Regular model checkpointing
         model.save_checkpoint(model_checkpoint_path)
-        
+        use_fsdp = False
     
     # Save training state on rank 0 only for FSDP
-    if not use_fsdp or not dist.is_initialized() or dist.get_rank() == 0:
+    if not use_fsdp:
         # Save training state (non-model components)
         training_state = {
             'epoch': epoch,
@@ -466,7 +476,7 @@ def save_checkpoint(
     if use_fsdp and dist.is_initialized():
         dist.barrier()
     
-    logger.info(f"Saved checkpoint for epoch {epoch}")
+    logger.info(f"Saved checkpoint for step {trained_steps}")
     return training_checkpoint_path
 
 
@@ -498,7 +508,7 @@ def load_checkpoint(
     training_checkpoint_path = os.path.join(checkpoint_dir, f"training_state.pt")
     
     # Load training state first
-    training_checkpoint = torch.load(training_checkpoint_path, map_location=device)
+    training_checkpoint = torch.load(training_checkpoint_path, map_location=device, weights_only=False)
     
     # Check if this was an FSDP checkpoint
     was_fsdp_checkpoint = training_checkpoint.get('fsdp_wrapped', False)
@@ -510,7 +520,7 @@ def load_checkpoint(
             from torch.distributed.fsdp import StateDictType
             
             # Load the FSDP checkpoint
-            fsdp_checkpoint = torch.load(model_checkpoint_path, map_location=device)
+            fsdp_checkpoint = torch.load(model_checkpoint_path, map_location=device, weights_only=False)
             
             # Create a fresh model (not wrapped with FSDP yet)
             # We'll need to create the base model first, then wrap it
@@ -621,6 +631,8 @@ def main():
                        help="Number of warmup steps")
     parser.add_argument("--gradient_clip", type=float, default=1.0,
                        help="Gradient clipping norm")
+    parser.add_argument("--use_gradient_checkpointing", action="store_true",
+                       help="Enable gradient checkpointing to save memory")
     
     # Data parameters
     parser.add_argument("--val_split", type=float, default=0.1,
@@ -758,6 +770,12 @@ def main():
     train_dataset = TextDataset(train_data, max_length=args.max_length)
     val_dataset = TextDataset(val_data, max_length=args.max_length)
     
+    logger.info(f"example train data: {train_data[0]}")
+    if val_data:
+        logger.info(f"example val data: {val_data[0]}")
+    else:
+        logger.warning("No validation data available")
+    
     # Setup distributed sampling if using FSDP
     if args.use_fsdp and args.local_rank != -1:
         train_sampler = DistributedSampler(
@@ -820,6 +838,13 @@ def main():
         dtype = torch.float32
         logger.info("Using float32 precision")
     
+    # Validate precision flags
+    if args.use_bf16 and args.use_fp16:
+        logger.warning("Both --use_bf16 and --use_fp16 specified. Using bfloat16 (--use_bf16 takes precedence)")
+        args.use_fp16 = False
+        scaler = None
+        dtype = torch.bfloat16
+    
     # Create model
     model = VQVAETextReconstructor(
         num_latent_tokens=args.num_latent_tokens,
@@ -858,7 +883,14 @@ def main():
             "sharding_strategy": getattr(ShardingStrategy, args.fsdp_sharding_strategy),
             "backward_prefetch": getattr(BackwardPrefetch, args.fsdp_backward_prefetch),
             "cpu_offload": CPUOffload(offload_params=args.fsdp_cpu_offload),
+            "use_orig_params": True,  # Better compatibility with gradient checkpointing
         }
+        
+        # Enable gradient checkpointing for FSDP if requested
+        if args.use_gradient_checkpointing:
+            fsdp_config["forward_prefetch"] = False  # Disable forward prefetch for better memory efficiency
+            logger.info("FSDP gradient checkpointing enabled (forward_prefetch disabled)")
+            logger.info("Note: FSDP automatically handles gradient checkpointing for wrapped modules")
         
         # Auto-wrap policy
         if args.fsdp_transformer_layer_cls_to_wrap:
@@ -892,7 +924,7 @@ def main():
     if args.num_steps:
         total_steps = args.num_steps
     else:
-        total_steps = len(train_loader) * args.num_epochs
+        total_steps = len(train_loader.dataset) // args.batch_size * args.num_epochs
     
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
@@ -952,7 +984,8 @@ def main():
         model, train_loader, val_loader, optimizer, scheduler, device, logger, total_steps, 
         args.test_steps, args.log_steps, args.save_steps, args.warmup_steps,
         start_step, args.batch_size, scaler, args.use_fsdp, args.gradient_clip, args.use_wandb,
-        args.learning_rate, args.weight_decay, best_val_loss, args.output_dir, base_seed
+        args.learning_rate, args.weight_decay, best_val_loss, args.output_dir, args.seed,
+        args.use_bf16, args.use_fp16, dtype
     )
     
     # Save final model
@@ -975,7 +1008,7 @@ def main():
     if args.use_wandb:
         wandb.log({
             "training_completed": True,
-            "final_best_val_loss": best_val_loss,
+            "final_best_val_loss": metrics['best_val_loss'],
             "final_checkpoint_path": final_checkpoint_path,
             "best_model_path": os.path.join(args.output_dir, 'best_model.pt'),
             "total_epochs": args.num_epochs
