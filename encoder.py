@@ -125,9 +125,18 @@ class VectorQuantizer(nn.Module):
         q_latent_loss = F.mse_loss(quantized, inputs.detach())
         loss = q_latent_loss + self.commitment_cost * e_latent_loss
         
-        # Calculate perplexity
+        # Calculate perplexity with numerical stability
         avg_probs = torch.mean(encodings, dim=0)
-        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+        # Add epsilon to prevent log(0) and ensure numerical stability
+        epsilon = 1e-10
+        log_probs = torch.log(avg_probs + epsilon)
+        # Use more stable computation for perplexity
+        entropy = -torch.sum(avg_probs * log_probs)
+        perplexity = torch.exp(entropy)
+        
+        # Ensure perplexity is finite
+        if torch.isnan(perplexity) or torch.isinf(perplexity):
+            perplexity = torch.tensor(1.0, device=perplexity.device, dtype=perplexity.dtype)
         
         return quantized, loss, perplexity, encoding_indices.view(batch_size, k)
 
@@ -161,7 +170,8 @@ def get_last_layer_representations(
     max_length: int = 512,
     return_token_text: bool = False,
     split_delimiters: Sequence[str] = ["\n", ".", "!", "?"],
-    return_cot_only: bool = False
+    return_cot_only: bool = False,
+    num_cot_traces: int = 1
 ) -> Union[Tuple[List[List[torch.Tensor]], List[List[List[str]]], List[str]], 
            Tuple[List[List[torch.Tensor]], List[List[List[str]]]],
            Tuple[List[List[torch.Tensor]], List[List[List[int]]], List[str]], 
@@ -180,12 +190,13 @@ def get_last_layer_representations(
         inputs (Union[str, Sequence]): 
             - Single string input
             - Question sequence, CoT sequence, and optional return_cot_only sequence
+            - For multi-CoT: question sequence, CoT1 sequence, CoT2 sequence, ..., CoTn sequence
         device (str): Device to run the model on ("cpu", "cuda", or specific device)
         max_length (int): Maximum sequence length for tokenization
         return_token_text (bool): Whether to return token text (True) or token indices (False)
         split_delimiters (Sequence[str]): Sequence of text delimiters to split on (e.g., ["\n", ".", "Answer:"])
         return_cot_only (bool): For question+cot pairs, if True, only return representations and tokens from the CoT part
-        
+        num_cot_traces (int): Number of CoT traces for multi-CoT encoding
     Returns:
         For text input:
             - If split_delimiters=None and return_token_text=False: tuple of (tensor, token_indices_list)
@@ -204,6 +215,7 @@ def get_last_layer_representations(
     if isinstance(inputs, str):
         # Single regular text
         is_qc_pairs = False
+        is_multi_cot = False
         questions = [None]
         cots = [None]
         cot_only_flags = [False]
@@ -214,19 +226,39 @@ def get_last_layer_representations(
             is_qc_pairs = True
             questions = inputs[0]
             cots = inputs[1]
-            cot_only_flags = [return_cot_only] * len(inputs[0])
+            cot_only_flags = [return_cot_only] * len(questions)
             concatenated_texts = [f"{q} {c}" for q, c in zip(questions, cots)]
-        elif len(inputs) == 3:
+            example_groups = list(range(len(questions)))
+        elif len(inputs) == 3 and type(inputs[2][0]) == bool:
             # Question+cot pair tuple with return_cot_only flag
             is_qc_pairs = True
             questions = inputs[0]
             cots = inputs[1]
             cot_only_flags = inputs[2]
             concatenated_texts = [f"{q} {c}" for q, c in zip(questions, cots)]
+            example_groups = list(range(len(questions)))
         else:
-            raise ValueError(f"Invalid tuple length {len(inputs)}. Expected 2 or 3 elements.")
+            # Question + multiple CoT paths
+            is_multi_cot = True
+            is_qc_pairs = True
+            questions = []
+            cots = []
+            concatenated_texts = []
+            cot_only_flags = []
+            example_groups = []
+            for i in range(len(inputs[0])):
+                for j in range(num_cot_traces):
+                    if inputs[i][j+1]:
+                        concatenated_texts.append(f"{inputs[i][0]} {inputs[i][j+1]}")
+                        questions.append(inputs[i][0])
+                        cots.append(inputs[i][j+1])
+                        example_groups.append(i)
+                        if len(inputs) > 1 + num_cot_traces and type(inputs[i][-1]) == bool:
+                            cot_only_flags.append(inputs[i][-1])
+            if len(inputs) == 1 + num_cot_traces:
+                cot_only_flags = [return_cot_only] * len(questions)
     else:
-        raise ValueError(f"Invalid text type: {type(inputs)}")
+        raise ValueError(f"Invalid input type: {type(inputs)}")
     
     # Tokenize the input texts
     inputs = tokenizer(
@@ -266,6 +298,8 @@ def get_last_layer_representations(
     batch_results = []
     batch_tokens = []
     batch_questions = []
+    batch_example_groups = []
+    batch_step_groups = []
     
     for batch_idx in range(len(concatenated_texts)):
         # Get the hidden states for this text
@@ -369,12 +403,17 @@ def get_last_layer_representations(
                 split_representations = [empty_tensor]
                 split_token_lists = [[]]
             
-            batch_results.append(split_representations)
-            batch_tokens.append(split_token_lists)
+            num_segments = len(split_representations)
+            batch_results += split_representations
+            batch_tokens += split_token_lists
             if is_qc_pairs:
-                batch_questions.append(questions[batch_idx])
+                batch_questions += [questions[batch_idx]] * num_segments
             else:
-                batch_questions.append(None)
+                batch_questions += [None] * num_segments
+            if is_multi_cot:
+                batch_example_groups += [example_groups[batch_idx]] * num_segments
+                batch_step_groups += list(range(num_segments))
+                
         else:
             # No splitting - stack the representations
             if meaningful_representations:
@@ -383,17 +422,18 @@ def get_last_layer_representations(
                 # If no meaningful tokens, return empty tensor
                 meaningful_representations = torch.empty(0, last_hidden_states.shape[-1])
             
-            batch_results.append(meaningful_representations)
-            batch_tokens.append(meaningful_tokens)
+            batch_results += [meaningful_representations]
+            batch_tokens += [meaningful_tokens]
             if is_qc_pairs:
-                batch_questions.append(questions[batch_idx])
+                batch_questions += [questions[batch_idx]]
             else:
-                batch_questions.append(None)
+                batch_questions += [None]
+            if is_multi_cot:
+                batch_example_groups += [example_groups[batch_idx]]
+                batch_step_groups += [None]
+    
     # Return results based on input type and parameters
-    if is_qc_pairs:
-        return batch_results, batch_tokens, batch_questions
-    else:
-        return batch_results, batch_tokens
+    return batch_results, batch_tokens, batch_questions, batch_example_groups, batch_step_groups
 
 
 # Example usage

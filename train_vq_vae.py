@@ -7,6 +7,7 @@ It includes data loading, training loops, validation, logging, and checkpointing
 
 Features:
 - Gradient checkpointing for memory efficiency (--use_gradient_checkpointing)
+- Gradient accumulation for larger effective batch sizes (--gradient_accumulation_steps)
 - FSDP support for distributed training
 - Mixed precision training (FP16/BF16)
 - Checkpoint resumption with optimizer state preservation
@@ -17,7 +18,7 @@ import sys
 import argparse
 import logging
 from typing import Tuple, Dict, Optional
-from dataloader import TextDataset, load_text_data, create_sample_data
+from dataloader import TextDataset, load_text_data, load_multi_cot_data, create_sample_data
 from utils import setup_logging, set_seed, get_random_state, set_random_state, get_deterministic_seed, DeterministicSampler
 import torch
 import torch.optim as optim
@@ -25,7 +26,7 @@ from torch.utils.data import DataLoader
 from transformers import get_linear_schedule_with_warmup
 import tqdm
 import wandb
-import os
+import random
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
     MixedPrecision,
@@ -54,18 +55,19 @@ def train_loop(
     val_dataloader: DataLoader,
     optimizer: optim.Optimizer,
     scheduler: Optional[optim.lr_scheduler._LRScheduler],
-    device: torch.device,
     logger: logging.Logger,
+    steps_per_epoch: int,
     total_steps: int,
     test_steps: int = None,
     log_steps: int = None,
     save_steps: int = None,
     warmup_steps: int = 1000,
     start_step: int = 0,
-    batch_size: int = 32,
+    total_epochs: int = 10,
     scaler: Optional[torch.cuda.amp.GradScaler] = None,
     use_fsdp: bool = False,
     gradient_clip: float = 1.0,
+    gradient_accumulation_steps: int = 1,
     use_wandb: bool = False,
     learning_rate: float = 1e-4,
     weight_decay: float = 1e-5,
@@ -81,17 +83,32 @@ def train_loop(
     
     Args:
         model: VQVAETextReconstructor model
-        dataloader: Training data loader
+        train_dataloader: Training data loader
+        val_dataloader: Validation data loader
         optimizer: Optimizer
         scheduler: Learning rate scheduler
-        device: Device to train on
         logger: Logger instance
+        steps_per_epoch: Steps per epoch
         total_steps: Total number of steps to train
+        test_steps: Steps between validation runs
+        log_steps: Steps between logging
+        save_steps: Steps between checkpoint saves
+        warmup_steps: Number of warmup steps
         start_step: Starting step
-        batch_size: Batch size
+        total_epochs: Total number of epochs
         scaler: Scaler for mixed precision training
         use_fsdp: Whether to use FSDP
         gradient_clip: Gradient clipping norm
+        gradient_accumulation_steps: Number of gradient accumulation steps
+        use_wandb: Whether to use Weights & Biases logging
+        learning_rate: Learning rate
+        weight_decay: Weight decay
+        best_val_loss: Best validation loss so far
+        output_dir: Output directory for checkpoints
+        base_seed: Base random seed
+        use_bf16: Whether to use bfloat16 precision
+        use_fp16: Whether to use float16 precision
+        dtype: Data type for mixed precision
         
     Returns:
         Dictionary with training metrics
@@ -102,25 +119,6 @@ def train_loop(
     total_recon_loss = 0.0
     total_perplexity = 0.0
     num_batches = 0
-    num_data = len(train_dataloader.dataset)
-    
-    # Calculate epochs more intuitively
-    # Note: Epochs are 1-indexed for user display (Epoch 1, 2, 3...)
-    # But internally we use 0-indexed for calculations
-    if num_data == 0:
-        logger.warning("No training data available")
-        return {}
-    
-    if batch_size <= 0:
-        logger.error(f"Invalid batch size: {batch_size}")
-        return {}
-    
-    # Calculate steps per epoch and total epochs
-    # steps_per_epoch: how many training steps make up one epoch
-    # current_epoch: which epoch we're currently in (0-indexed)
-    # total_epochs: total number of epochs we'll train for
-    steps_per_epoch = max(1, num_data // batch_size)
-    total_epochs = (total_steps + steps_per_epoch - 1) // steps_per_epoch  # Ceiling division
     
     if start_step >= total_steps:
         return {}
@@ -130,6 +128,9 @@ def train_loop(
     # Track current step and epoch
     current_step = 0
     metrics = {}
+    
+    # Gradient accumulation tracking
+    accumulation_step = 0
     
     # Main training loop
     while current_step < total_steps:
@@ -143,15 +144,13 @@ def train_loop(
         
         # Iterate through the dataloader for this epoch
         for batch in train_dataloader:
-            progress_bar.update(1)
             # Skip steps if we're resuming from a checkpoint
             if current_step < start_step:
                 current_step += 1
+                progress_bar.update(1)
                 continue
                 
             model.train()
-            # Forward pass
-            optimizer.zero_grad()
             
             # Use mixed precision if enabled
             if use_bf16 or use_fp16:
@@ -159,11 +158,33 @@ def train_loop(
                 with torch.amp.autocast(device_type='cuda', dtype=dtype):
                     vq_loss, perplexity, recon_loss, total_batch_loss = model(batch)
                 
+                # Scale loss by accumulation steps for proper averaging
+                total_batch_loss = total_batch_loss / gradient_accumulation_steps
+                
                 if scaler is not None:
                     # FP16 with GradScaler
                     scaler.scale(total_batch_loss).backward()
-                    
-                    # Gradient clipping
+                else:
+                    # BF16 without GradScaler
+                    total_batch_loss.backward()
+            else:
+                # FP32 training
+                vq_loss, perplexity, recon_loss, total_batch_loss = model(batch)
+                
+                # Scale loss by accumulation steps for proper averaging
+                total_batch_loss = total_batch_loss / gradient_accumulation_steps
+                
+                # Backward pass
+                total_batch_loss.backward()
+            
+            # Increment accumulation step
+            accumulation_step += 1
+            
+            # Check if we should perform optimizer step
+            if accumulation_step % gradient_accumulation_steps == 0:
+                # Apply gradient clipping
+                if scaler is not None:
+                    # FP16 with GradScaler
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip)
                     
@@ -171,102 +192,121 @@ def train_loop(
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    # BF16 without GradScaler
-                    total_batch_loss.backward()
-                    
-                    # Gradient clipping
+                    # BF16 or FP32
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip)
-                    
                     optimizer.step()
-            else:
-                # FP32 training
-                vq_loss, perplexity, recon_loss, total_batch_loss = model(batch)
                 
-                # Backward pass
-                total_batch_loss.backward()
+                # Zero gradients after optimizer step
+                optimizer.zero_grad()
                 
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=gradient_clip)
-                
-                optimizer.step()
-                
-            # Step the scheduler after training
-            if scheduler:
-                scheduler.step()
-                    
-            # Update metrics
-            total_loss += total_batch_loss.item()
-            total_vq_loss += vq_loss.item()
-            total_recon_loss += recon_loss.item()
-            total_perplexity += perplexity.item()
-            num_batches += 1
+                # Step the scheduler after optimizer step
+                if scheduler:
+                    scheduler.step()
             
-            # Update progress bar
-            progress_bar.set_postfix({
-                'Loss': f'{total_batch_loss.item():.4f}',
-                'VQ_Loss': f'{vq_loss.item():.4f}',
-                'Recon_Loss': f'{recon_loss.item():.4f}',
-                'Perplexity': f'{perplexity.item():.2f}'
-            })
-        
-            # Calculate moving averages
-            metrics['train_loss'] = total_loss / (current_step + 1)
-            metrics['train_vq_loss'] = total_vq_loss / (current_step + 1)
-            metrics['train_recon_loss'] = total_recon_loss / (current_step + 1)
-            metrics['train_perplexity'] = total_perplexity / (current_step + 1)
-
-            if test_steps and current_step % test_steps == 0:
-                test_metrics = validate_loop(model, val_dataloader, batch_size, logger)
-                metrics.update(test_metrics)
-                # Update best validation loss if we have validation metrics
-                if test_metrics and 'val_loss' in test_metrics and test_metrics['val_loss'] < best_val_loss:
-                    # Save best model
-                    best_model_path = os.path.join(output_dir, "best_model.pt")
-                    model.save_checkpoint(best_model_path)
-                    best_val_loss = test_metrics['val_loss']  # Update best_val_loss
-                    metrics['best_val_loss'] = best_val_loss
-                    logger.info(f"New best model saved with validation loss: {best_val_loss:.4f}")
+            # Check for NaN/Inf in training losses
+            if torch.isnan(total_batch_loss) or torch.isinf(total_batch_loss):
+                logger.warning(f"NaN/Inf detected in training step {current_step}")
+                logger.warning(f"  VQ loss: {vq_loss.item() if not torch.isnan(vq_loss) else 'NaN'}")
+                logger.warning(f"  Recon loss: {recon_loss.item() if not torch.isnan(recon_loss) else 'NaN'}")
+                logger.warning(f"  Total loss: {total_batch_loss.item() if not torch.isnan(total_batch_loss) else 'NaN'}")
+                # Skip this batch to prevent NaN propagation
+                continue
                     
-                    # Log best model info to WandB
+            # Update metrics (only count actual optimizer steps, not accumulation steps)
+            if accumulation_step % gradient_accumulation_steps == 0:
+                # Restore original loss values for logging (multiply back by accumulation steps)
+                original_total_loss = total_batch_loss * gradient_accumulation_steps
+                original_vq_loss = vq_loss * gradient_accumulation_steps
+                original_recon_loss = recon_loss * gradient_accumulation_steps
+                
+                total_loss += original_total_loss.item()
+                total_vq_loss += original_vq_loss.item()
+                total_recon_loss += original_recon_loss.item()
+                total_perplexity += perplexity.item()
+                num_batches += 1
+                
+                # Update progress bar with original loss values
+                progress_bar.set_postfix({
+                    'Loss': f'{original_total_loss.item():.4f}',
+                    'VQ_Loss': f'{original_vq_loss.item():.4f}',
+                    'Recon_Loss': f'{original_recon_loss.item():.4f}',
+                    'Perplexity': f'{perplexity.item():.2f}',
+                    'Accum': f'{accumulation_step % gradient_accumulation_steps + 1}/{gradient_accumulation_steps}'
+                })
+                
+                # Calculate moving averages
+                metrics['train_loss'] = total_loss / num_batches
+                metrics['train_vq_loss'] = total_vq_loss / num_batches
+                metrics['train_recon_loss'] = total_recon_loss / num_batches
+                metrics['train_perplexity'] = total_perplexity / num_batches
+            else:
+                # Update progress bar during accumulation
+                progress_bar.set_postfix({
+                    'Loss': f'{total_batch_loss.item():.4f}',
+                    'VQ_Loss': f'{vq_loss.item():.4f}',
+                    'Recon_Loss': f'{recon_loss.item():.4f}',
+                    'Perplexity': f'{perplexity.item():.2f}',
+                    'Accum': f'{accumulation_step % gradient_accumulation_steps + 1}/{gradient_accumulation_steps}'
+                })
+
+            # Only perform validation, logging, and checkpointing on actual optimizer steps
+            if accumulation_step % gradient_accumulation_steps == 0:
+                if test_steps and current_step % test_steps == 0:
+                    test_metrics = validate_loop(
+                        model, val_dataloader, logger,
+                        use_bf16=use_bf16, use_fp16=use_fp16, dtype=dtype
+                    )
+                    metrics.update(test_metrics)
+                    # Update best validation loss if we have validation metrics
+                    if test_metrics and 'val_loss' in test_metrics and test_metrics['val_loss'] < best_val_loss:
+                        # Save best model
+                        best_model_path = os.path.join(output_dir, "best_model.pt")
+                        model.save_checkpoint(best_model_path)
+                        best_val_loss = test_metrics['val_loss']  # Update best_val_loss
+                        metrics['best_val_loss'] = best_val_loss
+                        logger.info(f"New best model saved with validation loss: {best_val_loss:.4f}")
+                        
+                        # Log best model info to WandB
+                        if use_wandb:
+                            wandb.log({
+                                "best_val_loss": best_val_loss,
+                                "best_model_saved": True,
+                                "best_model_path": best_model_path
+                            }, step=current_step)
+                
+                # Log metrics
+                if log_steps and current_step % log_steps == 0:
+                    # Log step summary
+                    logger.info(f"Step {current_step} completed")
+                    for key, value in metrics.items():
+                        logger.info(f"{key}: {value:.4f}")
+                        # Log to WandB if enabled
+                        if use_wandb:
+                            wandb.log({key: value}, step=current_step)
+                
+                # Save checkpoint
+                if save_steps and current_step % save_steps == 0:
+                    checkpoint_path = save_checkpoint(
+                        model, optimizer, scheduler, 
+                        current_epoch + 1, warmup_steps, current_step, total_steps, 
+                        learning_rate, weight_decay, metrics,
+                        os.path.join(output_dir, "checkpoints"), logger,
+                        base_seed=base_seed,
+                        current_random_state=get_random_state(),
+                        use_fsdp=use_fsdp
+                    )
+                    
+                    # Log checkpoint info to WandB
                     if use_wandb:
                         wandb.log({
-                            "best_val_loss": best_val_loss,
-                            "best_model_saved": True,
-                            "best_model_path": best_model_path
+                            "checkpoint_saved": True,
+                            "checkpoint_path": checkpoint_path,
+                            "checkpoint_epoch": current_epoch + 1
                         }, step=current_step)
-            
-            # Log metrics
-            if log_steps and current_step % log_steps == 0:
-                # Log step summary
-                logger.info(f"Step {current_step} completed")
-                for key, value in metrics.items():
-                    logger.info(f"{key}: {value:.4f}")
-                    # Log to WandB if enabled
-                    if use_wandb:
-                        wandb.log({key: value}, step=current_step)
-            
-            # Save checkpoint
-            if save_steps and current_step % save_steps == 0:
-                checkpoint_path = save_checkpoint(
-                    model, optimizer, scheduler, 
-                    current_epoch + 1, warmup_steps, current_step, total_steps, 
-                    learning_rate, weight_decay, metrics,
-                    os.path.join(output_dir, "checkpoints"), logger,
-                    base_seed=base_seed,
-                    current_random_state=get_random_state(),
-                    use_fsdp=use_fsdp
-                )
                 
-                # Log checkpoint info to WandB
-                if use_wandb:
-                    wandb.log({
-                        "checkpoint_saved": True,
-                        "checkpoint_path": checkpoint_path,
-                        "checkpoint_epoch": current_epoch + 1
-                    }, step=current_step)
-            
-            # Increment step counter
-            current_step += 1
+                # Increment step counter (only on actual optimizer steps)
+                current_step += 1
+                progress_bar.update(1)
             
             # Check if we've reached total_steps
             if current_step >= total_steps:
@@ -278,8 +318,10 @@ def train_loop(
 def validate_loop(
     model: VQVAETextReconstructor,
     dataloader: DataLoader,
-    batch_size: int,
     logger: logging.Logger,
+    use_bf16: bool = False,
+    use_fp16: bool = False,
+    dtype: torch.dtype = torch.float32,
 ) -> Dict[str, float]:
     """
     Validate for one epoch.
@@ -287,8 +329,10 @@ def validate_loop(
     Args:
         model: VQVAETextReconstructor model
         dataloader: Validation data loader
-        batch_size: Batch size
         logger: Logger instance
+        use_bf16: Whether to use bfloat16 precision
+        use_fp16: Whether to use float16 precision
+        dtype: Data type for mixed precision
         
     Returns:
         Dictionary with validation metrics
@@ -308,8 +352,22 @@ def validate_loop(
     
     with torch.no_grad():
         for batch_idx, batch in enumerate(progress_bar):
-            # Forward pass
-            vq_loss, perplexity, recon_loss, total_batch_loss = model(batch)
+            # Forward pass with same precision as training
+            if use_bf16 or use_fp16:
+                # Use autocast for both bf16 and fp16 (same as training)
+                with torch.amp.autocast(device_type='cuda', dtype=dtype):
+                    vq_loss, perplexity, recon_loss, total_batch_loss = model(batch)
+            else:
+                # FP32 validation
+                vq_loss, perplexity, recon_loss, total_batch_loss = model(batch)
+            
+            # Check for NaN/Inf values
+            if torch.isnan(total_batch_loss) or torch.isinf(total_batch_loss):
+                logger.warning(f"NaN/Inf detected in validation batch {batch_idx}")
+                logger.warning(f"  VQ loss: {vq_loss.item() if not torch.isnan(vq_loss) else 'NaN'}")
+                logger.warning(f"  Recon loss: {recon_loss.item() if not torch.isnan(recon_loss) else 'NaN'}")
+                logger.warning(f"  Total loss: {total_batch_loss.item() if not torch.isnan(total_batch_loss) else 'NaN'}")
+                continue  # Skip this batch
             
             # Update metrics
             total_loss += total_batch_loss.item()
@@ -325,9 +383,15 @@ def validate_loop(
                 'Recon_Loss': f'{recon_loss.item():.4f}',
                 'Perplexity': f'{perplexity.item():.2f}'
             })
+            
+            # Clean up tensors and clear cache every few batches to prevent memory accumulation
+            del vq_loss, perplexity, recon_loss, total_batch_loss
+            if batch_idx % 10 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
     
     # Calculate averages
     if num_batches == 0:
+        logger.warning("No valid validation batches found")
         metrics = {
             'val_loss': float('inf'),
             'val_vq_loss': float('inf'),
@@ -604,21 +668,25 @@ def main():
                        help="Number of quantized vectors")
     parser.add_argument("--commitment_cost", type=float, default=0.25,
                        help="Commitment cost for vector quantization")
-    parser.add_argument("--max_length", type=int, default=512,
+    parser.add_argument("--max_length", type=int, default=1024,
                        help="Maximum sequence length")
     parser.add_argument("--train_decoder", action="store_true",
                        help="Whether to train the decoder")
     parser.add_argument("--previous_segments_mode", type=str, default="text",
                        choices=["text", "latent", "none"],
                        help="Mode for how to handle previous segments as context")
+    parser.add_argument("--num_cot_traces", type=int, default=1,
+                       help="Number of CoT traces per question for multi-CoT encoding")
     
     # Training parameters
     parser.add_argument("--train_data_path", type=str, default=None,
                        help="Path to training data")
     parser.add_argument("--val_data_path", type=str, default=None,
                        help="Path to validation data")
-    parser.add_argument("--batch_size", type=int, default=4,
-                       help="Training batch size")
+    parser.add_argument("--train_batch_size", type=int, default=4,
+                       help="Training batch size per device")
+    parser.add_argument("--val_batch_size", type=int, default=4,
+                       help="Validation batch size per device")
     parser.add_argument("--num_epochs", type=int, default=100,
                        help="Number of training epochs")
     parser.add_argument("--num_steps", type=int, default=None,
@@ -631,12 +699,16 @@ def main():
                        help="Number of warmup steps")
     parser.add_argument("--gradient_clip", type=float, default=1.0,
                        help="Gradient clipping norm")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                       help="Number of gradient accumulation steps before optimizer update")
     parser.add_argument("--use_gradient_checkpointing", action="store_true",
                        help="Enable gradient checkpointing to save memory")
     
     # Data parameters
     parser.add_argument("--val_split", type=float, default=0.1,
                        help="Validation split ratio")
+    parser.add_argument("--num_val_samples", type=int, default=1000,
+                       help="Maximum number of validation samples")
     parser.add_argument("--compress_cot_only", action="store_true",
                        help="Compress only chain-of-thought reasoning")
     parser.add_argument("--explain_token", type=str, default="<EXPLAIN>",
@@ -738,21 +810,29 @@ def main():
     
     if not args.train_data_path: # Create sample data if not provided
         sample_data_path = os.path.join(args.output_dir, "sample_data.json")
-        create_sample_data(sample_data_path, num_samples=100)
+        create_sample_data(sample_data_path, num_samples=100, num_cot_traces=args.num_cot_traces)
         args.train_data_path = sample_data_path
         logger.info(f"Created sample data at {sample_data_path}")
 
     try:
-        train_data = load_text_data(args.train_data_path)
-        logger.info(f"Loaded {len(train_data)} training examples")
+        if args.num_cot_traces > 1:
+            train_data = load_multi_cot_data(args.train_data_path, num_cot_traces=args.num_cot_traces)
+            logger.info(f"Loaded {len(train_data)} training examples with {args.num_cot_traces} CoT traces each")
+        else:
+            train_data = load_text_data(args.train_data_path)
+            logger.info(f"Loaded {len(train_data)} training examples")
     except Exception as e:
         logger.error(f"Failed to load data: {e}")
         return
     
     if args.val_data_path:
         try:
-            val_data = load_text_data(args.val_data_path)
-            logger.info(f"Loaded {len(val_data)} validation examples")
+            if args.num_cot_traces > 1:
+                val_data = load_multi_cot_data(args.val_data_path, num_cot_traces=args.num_cot_traces)
+                logger.info(f"Loaded {len(val_data)} validation examples with {args.num_cot_traces} CoT traces each")
+            else:
+                val_data = load_text_data(args.val_data_path)
+                logger.info(f"Loaded {len(val_data)} validation examples")
         except Exception as e:
             logger.error(f"Failed to load data: {e}")
             return
@@ -763,12 +843,17 @@ def main():
         val_data = train_data[train_size:]
         train_data = train_data[:train_size]
     
+    if len(val_data) > args.num_val_samples:
+        random.shuffle(val_data)
+        val_data = val_data[:args.num_val_samples]
+        logger.warning(f"Validation set size is greater than {args.num_val_samples}. Truncating to {args.num_val_samples} samples.")
+    
     logger.info(f"Training set size: {len(train_data)}")
     logger.info(f"Validation set size: {len(val_data)}")
     
     # Create datasets and dataloaders
-    train_dataset = TextDataset(train_data, max_length=args.max_length)
-    val_dataset = TextDataset(val_data, max_length=args.max_length)
+    train_dataset = TextDataset(train_data, max_length=args.max_length, num_cot_traces=args.num_cot_traces)
+    val_dataset = TextDataset(val_data, max_length=args.max_length, num_cot_traces=args.num_cot_traces)
     
     logger.info(f"example train data: {train_data[0]}")
     if val_data:
@@ -804,7 +889,7 @@ def main():
     
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
+        batch_size=args.train_batch_size,
         shuffle=shuffle,
         sampler=train_sampler,
         num_workers=0,  # Set to 0 to avoid multiprocessing issues
@@ -813,7 +898,7 @@ def main():
     
     val_loader = DataLoader(
         val_dataset,
-        batch_size=args.batch_size,
+        batch_size=args.val_batch_size,
         shuffle=False,
         sampler=val_sampler,
         num_workers=0,
@@ -859,7 +944,8 @@ def main():
         max_length=args.max_length,
         train_decoder=args.train_decoder,
         previous_segments_mode=args.previous_segments_mode,
-        device=device
+        device=device,
+        num_cot_traces=args.num_cot_traces
     )
     logger.info("Model created successfully")
     
@@ -921,10 +1007,33 @@ def main():
         weight_decay=args.weight_decay
     )
     
+    # Calculate effective batch size for logging
+    effective_batch_size = args.train_batch_size * args.gradient_accumulation_steps
+    num_data = len(train_loader.dataset)
+    
     if args.num_steps:
         total_steps = args.num_steps
     else:
-        total_steps = len(train_loader.dataset) // args.batch_size * args.num_epochs
+        total_steps = num_data // effective_batch_size * args.num_epochs
+    
+    # Calculate epochs more intuitively
+    # Note: Epochs are 1-indexed for user display (Epoch 1, 2, 3...)
+    # But internally we use 0-indexed for calculations
+    if num_data == 0:
+        logger.warning("No training data available")
+        return {}
+    
+    if effective_batch_size <= 0:
+        logger.error(f"Invalid batch size: {args.train_batch_size}")
+        return {}
+        
+    # Calculate steps per epoch and total epochs
+    # steps_per_epoch: how many training steps make up one epoch
+    # current_epoch: which epoch we're currently in (0-indexed)
+    # total_epochs: total number of epochs we'll train for
+    steps_per_epoch = max(1, num_data // effective_batch_size)
+    total_epochs = (total_steps + steps_per_epoch - 1) // steps_per_epoch  # Ceiling division
+    args.total_epochs = total_epochs
     
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
@@ -959,6 +1068,12 @@ def main():
                 "model_trainable_params": model_info['trainable_parameters'],
                 "model_size_mb": model_info['model_size_mb']
             })
+        
+        # Log gradient accumulation info
+        wandb.config.update({
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "effective_batch_size": effective_batch_size
+        })
                 
     else:
         logger.info("WandB logging disabled")
@@ -979,11 +1094,18 @@ def main():
     # Training loop
     logger.info("Starting training loop")
     
+    # Log effective batch size information
+    logger.info(f"Training batch size per device: {args.train_batch_size}")
+    logger.info(f"Validation batch size per device: {args.val_batch_size}")
+    logger.info(f"Gradient accumulation steps: {args.gradient_accumulation_steps}")
+    logger.info(f"Effective training batch size: {effective_batch_size}")
+    
     # Train
     metrics = train_loop(
-        model, train_loader, val_loader, optimizer, scheduler, device, logger, total_steps, 
+        model, train_loader, val_loader, optimizer, scheduler, logger, steps_per_epoch, total_steps, 
         args.test_steps, args.log_steps, args.save_steps, args.warmup_steps,
-        start_step, args.batch_size, scaler, args.use_fsdp, args.gradient_clip, args.use_wandb,
+        start_step, total_epochs, scaler, args.use_fsdp, args.gradient_clip, 
+        args.gradient_accumulation_steps, args.use_wandb,
         args.learning_rate, args.weight_decay, best_val_loss, args.output_dir, args.seed,
         args.use_bf16, args.use_fp16, dtype
     )
@@ -991,7 +1113,7 @@ def main():
     # Save final model
     final_checkpoint_path = save_checkpoint(
         model, optimizer, scheduler, 
-        args.num_epochs, args.warmup_steps, total_steps, total_steps, 
+        total_epochs, args.warmup_steps, total_steps, total_steps, 
         args.learning_rate, args.weight_decay, metrics,
         os.path.join(args.output_dir, "checkpoints"), logger,
         base_seed=args.seed,

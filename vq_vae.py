@@ -1,4 +1,5 @@
 import torch
+from torch.xpu.random import current_device
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
 from typing import Union, List, Tuple
 import torch.nn as nn
@@ -7,8 +8,16 @@ import os
 import sys
 import random
 import copy
+import gc
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from encoder import get_last_layer_representations, MultiHeadAttentionQuantizer, VectorQuantizer
+
+
+def clear_memory():
+    """Utility function to clear GPU memory and run garbage collection."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
 
 
 class VQVAETextReconstructor(nn.Module):
@@ -30,7 +39,10 @@ class VQVAETextReconstructor(nn.Module):
         max_length: int = 512,
         train_decoder: bool = False,
         previous_segments_mode: str = "text", # "text" or "latent" or "none"
-        device: str = "auto"
+        device: str = "auto",
+        num_cot_traces: int = 1,
+        parallel_token: str = "<PARALLEL>",
+        parallel_prediction_mode: str = "concatenate" # "concatenate" or "individual"
     ):
         super().__init__()
         self.num_latent_tokens = num_latent_tokens
@@ -45,15 +57,21 @@ class VQVAETextReconstructor(nn.Module):
         self.train_decoder = train_decoder
         self.previous_segments_mode = previous_segments_mode
         self.pretrained_model_name = pretrained_model_name
-        
+        self.num_cot_traces = num_cot_traces
+        self.parallel_token = parallel_token
+        self.parallel_prediction_mode = parallel_prediction_mode
         # Auto-detect device if specified
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
         
         # Load encoder and decoder models, move to device
-        self.encoder_model = AutoModel.from_pretrained(pretrained_model_name).to(device)
-        self.decoder_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name).to(device)
+        self.encoder_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name).to(device)
+        if self.train_decoder:
+            self.decoder_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name).to(device)
+            self.decoder_model.train()
+        else:
+            self.decoder_model = self.encoder_model
         self.tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name)
         
         # Set pad token if not set
@@ -64,14 +82,6 @@ class VQVAETextReconstructor(nn.Module):
         self.encoder_model.eval()
         for param in self.encoder_model.parameters():
             param.requires_grad = False
-        
-        # Freeze decoder model if not training
-        if self.train_decoder:
-            self.decoder_model.train()
-        else:
-            self.decoder_model.eval()
-            for param in self.decoder_model.parameters():
-                param.requires_grad = False
         
         # Get hidden size from encoder model
         self.hidden_size = self.encoder_model.config.hidden_size
@@ -92,13 +102,17 @@ class VQVAETextReconstructor(nn.Module):
         
         # Add explain token embedding if specified
         if self.explain_token:
-            self.explain_embedding = nn.Parameter(
+            self.explain_token_embedding = nn.Parameter(
                 torch.randn(1, self.hidden_size) * 0.02).to(device)
         
         # Add think token embedding if specified
         if self.think_token:
-            self.think_embedding = nn.Parameter(
+            self.think_token_embedding = nn.Parameter(
                 torch.randn(1, self.hidden_size) * 0.02).to(device)
+        
+        if self.num_cot_traces > 1:
+            self.parallel_token_embedding = nn.Parameter(
+                torch.randn(self.num_cot_traces, self.hidden_size) * 0.02).to(device)
             
     @classmethod
     def load_from_checkpoint(cls, checkpoint_path: str, device: str = "auto"):
@@ -136,7 +150,10 @@ class VQVAETextReconstructor(nn.Module):
             'compress_cot_only': config.get('compress_cot_only', True),
             'max_length': config.get('max_length', 512),
             'train_decoder': config.get('train_decoder', False),
-            'previous_segments_mode': config.get('previous_segments_mode', 'text')
+            'previous_segments_mode': config.get('previous_segments_mode', 'text'),
+            'num_cot_traces': config.get('num_cot_traces', 1),
+            'parallel_token': config.get('parallel_token', '<PARALLEL>'),
+            'parallel_prediction_mode': config.get('parallel_prediction_mode', 'concatenate')
         }
         
         # Create model instance
@@ -153,13 +170,17 @@ class VQVAETextReconstructor(nn.Module):
         if 'vq_state_dict' in trained_components:
             model.vq.load_state_dict(trained_components['vq_state_dict'])
         
-        # Load explain embedding if available
-        if 'explain_embedding' in trained_components:
-            model.explain_embedding = nn.Parameter(trained_components['explain_embedding'].to(model.device))
+        # Load explain token embedding if available
+        if 'explain_token_embedding' in trained_components:
+            model.explain_token_embedding = nn.Parameter(trained_components['explain_token_embedding'].to(model.device))
         
-        # Load thinking embedding if available
-        if 'think_embedding' in trained_components:
-            model.think_embedding = nn.Parameter(trained_components['think_embedding'].to(model.device))
+        # Load think token embedding if available
+        if 'think_token_embedding' in trained_components:
+            model.think_token_embedding = nn.Parameter(trained_components['think_token_embedding'].to(model.device))
+        
+        # Load parallel token embedding if available
+        if 'parallel_token_embedding' in trained_components:
+            model.parallel_token_embedding = nn.Parameter(trained_components['parallel_token_embedding'].to(model.device))
         
         print(f"Model loaded from checkpoint: {checkpoint_path}")
         print(f"Pretrained model: {config['pretrained_model_name']}")
@@ -168,48 +189,76 @@ class VQVAETextReconstructor(nn.Module):
         return model      
             
     def encode(self, 
-               inputs: Union[List[Tuple[str, str]], List[Tuple[str, str, bool]]]
+               inputs: Union[List[Tuple[str, str]], List[Tuple[str, str, bool]], List[Tuple[str, List[str]]]]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, 
                List[str], List[List[List[int]]], List[int]]:
         """
         Encode text to get quantized representations.
         
         Args:
-            inputs: Input list of (question, cot) pairs or list of (question, cot, return_cot_only) tuples. Always batched.
+            inputs: Input list of (question, cot) pairs, list of (question, cot, return_cot_only) tuples,
+                   or list of (question, [CoT1, CoT2, ..., CoTn]) tuples for multi-CoT encoding. Always batched.
             
         Returns:
-            Tuple of (quantized_vectors, vq_loss, perplexity)
+            Tuple of (quantized_vectors, vq_loss, perplexity, encoding_indices, questions, tokens, example_groups, step_groups)
         """
         # Get representations from frozen encoder
         with torch.no_grad():
             # representations are on cpu
-            representations, tokens, questions = get_last_layer_representations(
+            representations, tokens, questions, example_groups, step_groups = get_last_layer_representations(
                 self.encoder_model,
                 self.tokenizer,
                 inputs,
                 device=self.device,
                 max_length=self.max_length,
-                return_cot_only=self.compress_cot_only
+                return_cot_only=self.compress_cot_only,
+                num_cot_traces=self.num_cot_traces
             )
+            
+            # Clear cache after encoder forward pass
+            clear_memory()
         
-        all_inputs = []
-        all_tokens = []
-        all_questions = []
-        segment_groups = []
-        for i, (representation, token, question) in enumerate(zip(representations, tokens, questions)):
-            # check if encoded representations are split into multiple segments
-            if not isinstance(representation, list):
-                representation = [representation]
-                token = [token]
-                
-            # process each segment separately
-            for rep, tok in zip(representation, token):
-                if len(tok) > 0: # skip empty segments
-                    all_inputs.append(rep)
-                    all_tokens.append(tok)
-                    all_questions.append(question)
-                    # build segment groups
-                    segment_groups.append(i)
+        if self.num_cot_traces > 1:
+            all_inputs = []
+            all_tokens = []
+            all_questions = []
+            all_step_groups = []
+            all_example_groups = []
+            current_example_group = 0
+            max_num_steps = max(step_groups) + 1
+            current_inputs = [[] for _ in range(max_num_steps)]
+            current_tokens = [[] for _ in range(self.num_cot_traces)]
+            current_question = questions[0]
+            current_trace_group = -1
+            for i in range(len(representations)):
+                if example_groups[i] != current_example_group:
+                    for j in range(max_num_steps):
+                        if len(current_inputs[j]) > 0:
+                            all_inputs.append(torch.cat(current_inputs[j], dim=0))
+                            all_example_groups.append(current_example_group)
+                            all_step_groups.append(j)
+                            if j == 0:
+                                all_tokens.append(current_tokens)
+                            else:
+                                all_tokens.append(None)
+                            all_questions.append(current_question)
+                    current_inputs = [[] for _ in range(max_num_steps)]
+                    current_tokens = [[] for _ in range(self.num_cot_traces)]
+                    current_question = questions[i]
+                    current_example_group = example_groups[i]
+                    current_trace_group = -1
+                assert current_question == questions[i]
+                current_inputs[step_groups[i]].append(representations[i])
+                current_inputs[step_groups[i]].append(self.parallel_token_embedding.unsqueeze(0))
+                if step_groups[i] == 0:
+                    current_trace_group += 1
+                current_tokens[current_trace_group].append(tokens[i])
+        else:
+            all_inputs = representations
+            all_tokens = tokens
+            all_questions = questions
+            all_example_groups = example_groups
+            all_step_groups = step_groups
                 
         # pad sequences to the same length and create attention mask
         batch_size = len(all_inputs)
@@ -223,7 +272,7 @@ class VQVAETextReconstructor(nn.Module):
             # create attention mask for padded input embeddings. True represents masked tokens.
             attention_mask[i, :, len(input_representation):] = 1
         # attention mask tensor: [N * H, T, S]
-        attention_mask = torch.repeat_interleave(attention_mask, self.k, dim=0)
+        attention_mask = torch.repeat_interleave(attention_mask, self.num_heads, dim=0)
         
         # apply multi-head attention quantizer
         quantized_vectors = self.quantizer(padded_inputs, attention_mask)
@@ -231,13 +280,18 @@ class VQVAETextReconstructor(nn.Module):
         # apply vector quantization
         quantized, vq_loss, perplexity, encoding_indices = self.vq(quantized_vectors)
         
-        return quantized, vq_loss, perplexity, encoding_indices, all_questions, all_tokens, segment_groups
+        # Clean up intermediate tensors
+        del padded_inputs, attention_mask, quantized_vectors
+        clear_memory()
+        
+        return quantized, vq_loss, perplexity, encoding_indices, all_questions, all_tokens, all_example_groups, all_step_groups
     
     def decode(self, 
                quantized_vectors: torch.Tensor, 
                original_tokens: List[List[int]], 
                questions: List[str]=None,
-               segment_groups: List[int]=None,
+               example_groups: List[int]=None,
+               step_groups: List[int]=None,
                batch_order: str = "length" # "random", "length", or "none"
     ) -> torch.Tensor:
         """
@@ -250,14 +304,16 @@ class VQVAETextReconstructor(nn.Module):
             quantized_vectors: all quantized vectors, shape: (num_segments, k, hidden_size)
             original_tokens: List of tokenized (potentially split) original CoT segments, shape: (num_segments, num_tokens)
             questions: List of questions for each CoT in the batch, shape: (num_segments, num_tokens)
-            segment_groups: List of segment groups for each CoT in the batch, shape: (num_segments,)
+            example_groups: List of example groups for each CoT in the batch, shape: (num_segments,)
+            step_groups: List of step groups for each CoT in the batch, shape: (num_segments,)
         Returns:
             Average reconstruction loss across the batch
         """
         embed_layer = self.decoder_model.get_input_embeddings()
         ctx = torch.enable_grad() if self.train_decoder else torch.no_grad()
         num_segments = len(quantized_vectors)
-        batch_size = max(segment_groups) + 1
+        batch_size = max(example_groups) + 1
+        max_num_steps = max(step_groups) + 1
         
         # Pre-compute all token embeddings to avoid repeated lookups
         all_tokens = []
@@ -286,18 +342,24 @@ class VQVAETextReconstructor(nn.Module):
                 question_positions.append(list(range(len(all_tokens)-len(question), len(all_tokens))))
         
         # add original tokens
-        for original_token in original_tokens:
-            all_tokens += original_token
-            original_positions.append(list(range(len(all_tokens)-len(original_token), len(all_tokens))))
-        
-        # # Validate that original_positions and original_tokens have matching lengths
-        # for i, (pos, tokens) in enumerate(zip(original_positions, original_tokens)):
-        #     if len(pos) != len(tokens):
-        #         print(f"Error: Length mismatch in original data at index {i}: positions={len(pos)}, tokens={len(tokens)}")
-        #         # Ensure they match by truncating to the shorter length
-        #         print("positions: ", pos)
-        #         print("tokens: ", tokens)
-        #         exit(1)
+        if self.num_cot_traces > 1:
+            for original_token in original_tokens:
+                if original_token:
+                    positions = []
+                    for token in original_token:
+                        position = []
+                        for t in token:
+                            if len(t) > 0:
+                                all_tokens += t
+                                position.append(list(range(len(all_tokens)-len(t), len(all_tokens))))
+                        positions.append(position)
+                    original_positions.append(positions)
+                else:
+                    original_positions.append(None)
+        else:
+            for original_token in original_tokens:
+                all_tokens += original_token
+                original_positions.append(list(range(len(all_tokens)-len(original_token), len(all_tokens))))
             
         # get positions of quantized vectors
         start_idx = len(all_tokens)
@@ -318,16 +380,23 @@ class VQVAETextReconstructor(nn.Module):
         # add explain token embedding if specified
         if self.explain_token:
             # add explain token embedding to token embeddings
-            token_embeddings = torch.cat([token_embeddings, self.explain_embedding], dim=0)
+            token_embeddings = torch.cat([token_embeddings, self.explain_token_embedding], dim=0)
             # get position of explain token
             explain_token_position = len(token_embeddings) - 1
         
         # add think token embedding if specified
         if self.think_token:
             # add think token embedding to token embeddings
-            token_embeddings = torch.cat([token_embeddings, self.think_embedding], dim=0)
+            token_embeddings = torch.cat([token_embeddings, self.think_token_embedding], dim=0)
             # get position of think token
             think_token_position = len(token_embeddings) - 1
+        
+        # add parallel token embedding if specified
+        if self.num_cot_traces > 1:
+            # add parallel token embedding to token embeddings
+            token_embeddings = torch.cat([token_embeddings, self.parallel_token_embedding], dim=0)
+            # get position of parallel token
+            parallel_token_position = len(token_embeddings) - 1
         
         if self.previous_segments_mode == "text":
             segments_positions = copy.deepcopy(original_positions)
@@ -338,53 +407,102 @@ class VQVAETextReconstructor(nn.Module):
         else:
             raise ValueError(f"Invalid previous segments mode: {self.previous_segments_mode}")
         
-        # get positions of previous segments
-        prev_group = None
-        previous_segments_positions = []
-        for group, segment_position in zip(segment_groups, segments_positions):
-            if group != prev_group:
-                previous_segments_positions.append([])
-                previous_segments_position = segment_position
-                prev_group = group
-            else:
-                previous_segments_position += segment_position
-                previous_segments_positions.append(previous_segments_position)
-
         # Build input batch with positions
         input_positions = []
         labels = []
-        
-        for i in range(num_segments):
-            cur_segment_positions = []
-            cur_labels = []
-            if self.prompt:
-                cur_segment_positions += prompt_positions
-            if questions:
-                cur_segment_positions += question_positions[i]
-            if self.think_token and self.previous_segments_mode == "latent":
-                cur_segment_positions.append(think_token_position)
-            if previous_segments_positions:
-                cur_segment_positions += previous_segments_positions[i]
-            if self.explain_token and self.previous_segments_mode == "text":
-                cur_segment_positions.append(think_token_position)
-            cur_segment_positions += quantized_positions[i]
-            if self.explain_token:
-                cur_segment_positions.append(explain_token_position)
-            cur_labels += [-100] * len(cur_segment_positions)
+        if self.num_cot_traces > 1:
+            # for multi-CoT setting, each quantized vector is associated with multiple original tokens
+            # condition on different CoT traces, the quantized vectors should predict different original tokens
+            current_example_group = None
+            current_quantized_positions = []
+            current_step_group = []
+            for i in range(num_segments):
+                if example_groups[i] != current_example_group:
+                    if current_example_group:
+                        for original_position in current_segment_positions:
+                            current_previous_positions = []
+                            for j, original_step_position in enumerate(original_position):
+                                if len(original_step_position) == 0:
+                                    continue
+                                current_input_positions = []
+                                current_labels = []
+                                assert current_step_group[j] == j, \
+                                    f"Step group mismatch: {current_step_group[j]} != {j}"
+                                if self.prompt:
+                                    current_input_positions += prompt_positions
+                                if questions:
+                                    current_input_positions += current_question_positions
+                                if current_previous_positions:
+                                    current_input_positions += current_previous_positions
+                                current_previous_positions += original_step_position
+                                if self.think_token: # ignore the previous segments mode. Always use text mode.
+                                    current_input_positions.append(think_token_position)
+                                current_input_positions += current_quantized_positions[j]
+                                if self.explain_token:
+                                    current_input_positions.append(explain_token_position)
+                                current_labels += [-100] * len(current_input_positions)
+                                current_input_positions += original_step_position
+                                current_labels += original_step_position
+                                assert len(current_input_positions) == len(current_labels), \
+                                    f"Length mismatch: positions={len(current_input_positions)}, labels={len(current_labels)}"
+                                input_positions.append(current_input_positions)
+                                labels.append(current_labels)
+                    current_example_group = example_groups[i]
+                    current_quantized_positions = []
+                    current_step_group = []
+                    
+                if original_tokens[i]:
+                    current_segment_positions = original_positions[i]
+                current_question_positions = question_positions[i]
+                current_quantized_positions.append(quantized_positions[i])
+                current_step_group.append(step_groups[i])
             
-            # # Ensure original_positions[i] and original_tokens[i] have matching lengths
-            # if len(original_positions[i]) != len(original_tokens[i]):
-            #     print(f"Error: Length mismatch at segment {i}: positions={len(original_positions[i])}, tokens={len(original_tokens[i])}")
-            #     print("positions: ", original_positions[i])
-            #     print("tokens: ", original_tokens[i])
-            #     exit(1)
-            # else:
-            cur_segment_positions += original_positions[i]
-            cur_labels += original_tokens[i]
-            # Ensure input_positions and labels have the same length
-            assert len(cur_segment_positions) == len(cur_labels), f"Length mismatch: positions={len(cur_segment_positions)}, labels={len(cur_labels)}"
-            input_positions.append(cur_segment_positions)
-            labels.append(cur_labels)
+        else:
+            # get positions of previous segments first
+            prev_group = None
+            previous_segments_positions = []
+            for group, segment_position in zip(example_groups, segments_positions):
+                if group != prev_group:
+                    previous_segments_positions.append([])
+                    previous_segments_position = segment_position
+                    prev_group = group
+                else:
+                    previous_segments_position += segment_position
+                    previous_segments_positions.append(previous_segments_position)
+            
+            # build input batch with positions
+            for i in range(num_segments):
+                cur_segment_positions = []
+                cur_labels = []
+                if self.prompt:
+                    cur_segment_positions += prompt_positions
+                if questions:
+                    cur_segment_positions += question_positions[i]
+                if self.think_token and self.previous_segments_mode == "latent":
+                    cur_segment_positions.append(think_token_position)
+                if previous_segments_positions:
+                    cur_segment_positions += previous_segments_positions[i]
+                if self.think_token and self.previous_segments_mode == "text":
+                    cur_segment_positions.append(think_token_position)
+                cur_segment_positions += quantized_positions[i]
+                if self.explain_token:
+                    cur_segment_positions.append(explain_token_position)
+                cur_labels += [-100] * len(cur_segment_positions)
+                
+                # # Ensure original_positions[i] and original_tokens[i] have matching lengths
+                # if len(original_positions[i]) != len(original_tokens[i]):
+                #     print(f"Error: Length mismatch at segment {i}: positions={len(original_positions[i])}, tokens={len(original_tokens[i])}")
+                #     print("positions: ", original_positions[i])
+                #     print("tokens: ", original_tokens[i])
+                #     exit(1)
+                # else:
+                cur_segment_positions += original_positions[i]
+                cur_labels += original_tokens[i]
+                # Ensure input_positions and labels have the same length
+                assert len(cur_segment_positions) == len(cur_labels), \
+                    f"Length mismatch: positions={len(cur_segment_positions)}, labels={len(cur_labels)}"
+                input_positions.append(cur_segment_positions)
+                labels.append(cur_labels)
             
         # reorder modified_embeddings and labels to optimize performance/memory usage
         if batch_order == "random": # possibly performance gain through randomization
@@ -432,7 +550,8 @@ class VQVAETextReconstructor(nn.Module):
             padded_labels = [[-100] * batch_max_length for _ in range(batch_size)]
 
             for i, (input_position, label) in enumerate(zip(input_positions, labels)):
-                assert len(input_position) == len(label), f"Length mismatch: positions={len(input_position)}, labels={len(label)}"
+                assert len(input_position) == len(label), \
+                    f"Length mismatch: positions={len(input_position)}, labels={len(label)}"
                 seq_len = len(input_position)
                 # Ensure sequences are truncated to the same length
                 if seq_len > batch_max_length:
@@ -454,14 +573,14 @@ class VQVAETextReconstructor(nn.Module):
             padded_labels = torch.tensor(padded_labels, device=self.device, dtype=torch.long)
         
             padded_input_positions_flat = padded_input_positions.flatten()
-            one_hot = torch.zeros(len(padded_input_positions_flat), token_embeddings.shape[0], device=self.device)
-            # Ensure the indices tensor has the right shape for scatter_
-            indices = padded_input_positions_flat.unsqueeze(1)  # Add dimension for scatter_
-            one_hot.scatter_(1, indices, 1)
             
-            # Get input embeddings
-            padded_input_embeddings = torch.matmul(one_hot, token_embeddings)
+            # Memory-efficient embedding lookup using advanced indexing instead of one-hot
+            # This avoids creating a massive one-hot tensor
+            padded_input_embeddings = token_embeddings[padded_input_positions_flat]
             padded_input_embeddings = padded_input_embeddings.view(batch_size, batch_max_length, self.hidden_size)
+            
+            # Clean up intermediate tensors
+            del padded_input_positions_flat
         
             # Run decoder model with custom embeddings and labels using inputs_embeds argument
             # This bypasses the embedding layer and directly uses our custom embeddings
@@ -482,6 +601,10 @@ class VQVAETextReconstructor(nn.Module):
                 print(f"Error: Model output has no loss attribute. Output type: {type(model_outputs)}")
                 print(f"Available attributes: {dir(model_outputs)}")
                 exit(1)
+            
+            # Clean up large tensors to prevent memory accumulation
+            del padded_input_embeddings, attention_mask, padded_labels, model_outputs
+            clear_memory()
         
         reconstruction_loss /= len(batch_input_positions)
         
@@ -489,12 +612,13 @@ class VQVAETextReconstructor(nn.Module):
         return reconstruction_loss
     
     
-    def forward(self, inputs: Union[List[Tuple[str, str]], List[Tuple[str, str, bool]]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, inputs: Union[List[Tuple[str, str]], List[Tuple[str, str, bool]], List[Tuple[str, List[str]]]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass through the VQ-VAE.
         
         Args:
-            inputs: Input list of (question, cot) pairs or list of (question, cot, return_cot_only) tuples. Always batched.
+            inputs: Input list of (question, cot) pairs, list of (question, cot, return_cot_only) tuples,
+                   or list of (question, [CoT1, CoT2, ..., CoTn]) tuples for multi-CoT encoding. Always batched.
             
         Returns:
             Tuple of (vq_loss, perplexity, reconstruction_loss, total_loss)
@@ -537,7 +661,8 @@ class VQVAETextReconstructor(nn.Module):
                 'compress_cot_only': self.compress_cot_only,
                 'max_length': self.max_length,
                 'train_decoder': self.train_decoder,
-                'previous_segments_mode': self.previous_segments_mode
+                'previous_segments_mode': self.previous_segments_mode,
+                'num_cot_traces': self.num_cot_traces
             },
             'trained_components': {
                 'quantizer_state_dict': self.quantizer.state_dict(),
@@ -547,12 +672,16 @@ class VQVAETextReconstructor(nn.Module):
         }
         
         # Add explain embedding if it exists
-        if hasattr(self, 'explain_embedding'):
-            checkpoint_data['trained_components']['explain_embedding'] = self.explain_embedding.data
+        if hasattr(self, 'explain_token_embedding'):
+            checkpoint_data['trained_components']['explain_token_embedding'] = self.explain_token_embedding.data
         
         # Add thinking embedding if it exists
-        if hasattr(self, 'think_embedding'):
-            checkpoint_data['trained_components']['think_embedding'] = self.think_embedding.data
+        if hasattr(self, 'think_token_embedding'):
+            checkpoint_data['trained_components']['think_token_embedding'] = self.think_token_embedding.data
+            
+        # Add parallel token embedding if it exists
+        if hasattr(self, 'parallel_token_embedding'):
+            checkpoint_data['trained_components']['parallel_token_embedding'] = self.parallel_token_embedding.data
         
         torch.save(checkpoint_data, checkpoint_path)
         
@@ -573,7 +702,8 @@ class VQVAETextReconstructor(nn.Module):
                 'compress_cot_only': self.compress_cot_only,
                 'max_length': self.max_length,
                 'train_decoder': self.train_decoder,
-                'previous_segments_mode': self.previous_segments_mode
+                'previous_segments_mode': self.previous_segments_mode,
+                'num_cot_traces': self.num_cot_traces
             },
             'model_info': {
                 'encoder_model_type': type(self.encoder_model).__name__,
@@ -605,11 +735,12 @@ class VQVAETextReconstructor(nn.Module):
         
         # Count custom embeddings
         custom_embedding_params = 0
-        if hasattr(self, 'explain_embedding'):
-            custom_embedding_params += self.explain_embedding.numel()
-        if hasattr(self, 'think_embedding'):
-            custom_embedding_params += self.think_embedding.numel()
-        
+        if hasattr(self, 'explain_token_embedding'):
+            custom_embedding_params += self.explain_token_embedding.numel()
+        if hasattr(self, 'think_token_embedding'):
+            custom_embedding_params += self.think_token_embedding.numel()
+        if hasattr(self, 'parallel_token_embedding'):
+            custom_embedding_params += self.parallel_token_embedding.numel()
         # All our custom components are trainable
         trainable_params += quantizer_params + vq_params + custom_embedding_params
         frozen_params += encoder_params
@@ -667,20 +798,28 @@ class VQVAETextReconstructor(nn.Module):
         
         # Custom embeddings
         custom_embeddings = {}
-        if hasattr(self, 'explain_embedding') and self.explain_embedding.requires_grad:
-            custom_embeddings['explain_embedding'] = {
-                'shape': list(self.explain_embedding.shape),
-                'numel': self.explain_embedding.numel(),
-                'dtype': str(self.explain_embedding.dtype),
-                'device': str(self.explain_embedding.device)
+        if hasattr(self, 'explain_token_embedding') and self.explain_token_embedding.requires_grad:
+            custom_embeddings['explain_token_embedding'] = {
+                'shape': list(self.explain_token_embedding.shape),
+                'numel': self.explain_token_embedding.numel(),
+                'dtype': str(self.explain_token_embedding.dtype),
+                'device': str(self.explain_token_embedding.device)
             }
         
-        if hasattr(self, 'think_embedding') and self.think_embedding.requires_grad:
-            custom_embeddings['think_embedding'] = {
-                'shape': list(self.think_embedding.shape),
-                'numel': self.think_embedding.numel(),
-                'dtype': str(self.think_embedding.dtype),
-                'device': str(self.think_embedding.device)
+        if hasattr(self, 'think_token_embedding') and self.think_token_embedding.requires_grad:
+            custom_embeddings['think_token_embedding'] = {
+                'shape': list(self.think_token_embedding.shape),
+                'numel': self.think_token_embedding.numel(),
+                'dtype': str(self.think_token_embedding.dtype),
+                'device': str(self.think_token_embedding.device)
+            }
+        
+        if hasattr(self, 'parallel_token_embedding') and self.parallel_token_embedding.requires_grad:
+            custom_embeddings['parallel_token_embedding'] = {
+                'shape': list(self.parallel_token_embedding.shape),
+                'numel': self.parallel_token_embedding.numel(),
+                'dtype': str(self.parallel_token_embedding.dtype),
+                'device': str(self.parallel_token_embedding.device)
             }
         
         if custom_embeddings:
@@ -760,22 +899,31 @@ class VQVAETextReconstructor(nn.Module):
         
         # Custom embeddings
         custom_embeddings = {}
-        if hasattr(self, 'explain_embedding'):
-            custom_embeddings['explain_embedding'] = {
-                'shape': list(self.explain_embedding.shape),
-                'numel': self.explain_embedding.numel(),
-                'dtype': str(self.explain_embedding.dtype),
-                'device': str(self.explain_embedding.device),
-                'requires_grad': self.explain_embedding.requires_grad
+        if hasattr(self, 'explain_token_embedding'):
+            custom_embeddings['explain_token_embedding'] = {
+                'shape': list(self.explain_token_embedding.shape),
+                'numel': self.explain_token_embedding.numel(),
+                'dtype': str(self.explain_token_embedding.dtype),
+                'device': str(self.explain_token_embedding.device),
+                'requires_grad': self.explain_token_embedding.requires_grad
             }
         
-        if hasattr(self, 'think_embedding'):
-            custom_embeddings['think_embedding'] = {
-                'shape': list(self.think_embedding.shape),
-                'numel': self.think_embedding.numel(),
-                'dtype': str(self.think_embedding.dtype),
-                'device': str(self.think_embedding.device),
-                'requires_grad': self.think_embedding.requires_grad
+        if hasattr(self, 'think_token_embedding'):
+            custom_embeddings['think_token_embedding'] = {
+                'shape': list(self.think_token_embedding.shape),
+                'numel': self.think_token_embedding.numel(),
+                'dtype': str(self.think_token_embedding.dtype),
+                'device': str(self.think_token_embedding.device),
+                'requires_grad': self.think_token_embedding.requires_grad
+            }
+        
+        if hasattr(self, 'parallel_token_embedding'):
+            custom_embeddings['parallel_token_embedding'] = {
+                'shape': list(self.parallel_token_embedding.shape),
+                'numel': self.parallel_token_embedding.numel(),
+                'dtype': str(self.parallel_token_embedding.dtype),
+                'device': str(self.parallel_token_embedding.device),
+                'requires_grad': self.parallel_token_embedding.requires_grad
             }
         
         if custom_embeddings:
